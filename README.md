@@ -81,7 +81,7 @@ make && ./Onion-PIR --test pir
 ## Multi-client streaming mode (uncooperative database)
 
 `onion_server` / `onion_client` run OnionPIR for **C concurrent clients** against an
-**uncooperative database** that the single server must stream every round. The
+**uncooperative database** that the servers must stream every round. The
 database is the unmodified Go service from the Zealot/shuffle repository
 (`../shuffle`, `cmd/testserver`), reached through its own gRPC API
 (`Database.StreamRecords`), so results are directly comparable with Zealot.
@@ -106,6 +106,16 @@ database is the unmodified Go service from the Zealot/shuffle repository
   The server never stores the database. Per client it keeps O(log rows)
   ciphertexts plus the expanded query, about 26 MB at the default chunk size. The
   server prints the estimate and warns if C would exceed RAM.
+- *Several servers.* Like Zealot's proxies, there can be several OnionPIR servers,
+  one per proxy. The clients are split into contiguous chunks, one per server
+  (the first `C % P` servers take one extra), and each client runs the unchanged
+  protocol with its own server only. The last server is the database streamer:
+  it alone reads the database, and every server forwards the raw records,
+  unencrypted, to the server before it in batches of up to 4 MiB as they
+  arrive (`--db` on the streamer, `--relay-to` on every server but the first).
+  The database is still read once per round, and each server holds only its
+  own clients' state. The relay is server-to-server only (frame types
+  `RelayOpen` / `RelayRecords`); keys, queries and results are unchanged.
 - Only the composite config (`k1_comp`, the default) is supported by the
   streaming server.
 
@@ -135,16 +145,20 @@ python3 scripts/build_remote.py --aws-config ../shuffle/awsConfigs/c8i16xlarge.j
 
 Experiments are specified exactly as for Zealot: an AWS config plus a shuffle
 experiment config, with `--N`, `--C`, `--B` (RecordBytes) overrides. In the AWS
-config, `serverInstance` runs the database and `onionServerInstance` runs the
-OnionPIR server (default: the last `proxyInstances` entry, Zealot's database
-streamer). `clientInstance` runs the clients (default: the server host). See
+config, `serverInstance` runs the database and each of `proxyInstances` runs an
+OnionPIR server, the last one streaming the database (Zealot's P_DB). Setting
+`onionServerInstance` runs a single server instead. `clientInstance` runs the
+clients (default: the database streamer's host). C must be at least the number
+of servers. See
 `awsConfigs/example.json` for the optional `onion*` knobs. The driver builds HEXL
 on first use (`scripts/ec2_setup.sh`, into `/opt/hexl`) and builds out of tree in
 `/tmp/onionpir-build`. It expects both repos to be cloned on the server and
 client hosts at `--remote-repo` / `--remote-shuffle` (defaults
-`/home/ec2-user/OnionPIR-Extended`, `/home/ec2-user/shuffle`). The OnionPIR server
-listens on the port of the config's last `ProxyAddresses` entry; the database
-listens on `ServerAddr`'s port.
+`/home/ec2-user/OnionPIR-Extended`, `/home/ec2-user/shuffle`). OnionPIR server `i`
+listens on the port of `ProxyAddresses[i]` (with fewer servers than proxies, the
+last ones are used, so a single server takes the last port); the database
+listens on `ServerAddr`'s port. `scripts/local_test.py` runs the same topology on
+127.0.0.1, one server per proxy by default (`--servers P` to change it).
 
 **Output.** The client prints Zealot's `=== Performance Metrics ===` block with
 the same labels, so the two systems can be compared line for line.

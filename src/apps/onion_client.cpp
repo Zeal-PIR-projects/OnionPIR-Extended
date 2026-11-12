@@ -10,6 +10,10 @@
 // "Query-to-result latency" (avg) is the end-to-end latency compared with
 // Zealot's metric of the same name: from the start of a client's query
 // generation until its record is decrypted and verified.
+//
+// With several servers (--server A,B,...), the clients are split into
+// contiguous chunks, one per server (split_clients in wire.h); each client
+// runs the unchanged protocol with its own server only.
 
 #include "args.h"
 #include "client.h"
@@ -38,9 +42,10 @@ using Clock = std::chrono::steady_clock;
 static const char *kUsage = R"(usage: onion_client --server HOST:PORT --N RECORDS --B RECORD_BYTES --C CLIENTS
                     [--connections K] [--threads T] [--seed S] [--timeout SEC]
                     [--demo-index I]
-  --server       onion_server address
-  --N --B --C    must match the server
-  --connections  TCP connections shared by the simulated clients (default min(C, 16))
+  --server       onion_server address, or a comma-separated list of servers; client
+                 chunks are assigned in list order (server s gets the s-th chunk)
+  --N --B --C    database records, bytes per record, total clients (all servers)
+  --connections  TCP connections per server, shared by its clients (default 16)
   --threads      client-side worker threads (default: all cores)
   --seed         RNG seed for the queried indices (default: random)
   --timeout      seconds to wait for all results (default 3600)
@@ -89,15 +94,34 @@ std::string printable(const std::vector<uint8_t> &bytes) {
   return s;
 }
 
+std::vector<std::string> split_list(const std::string &s) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  for (;;) {
+    const size_t comma = s.find(',', start);
+    out.push_back(s.substr(start, comma - start));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return out;
+}
+
+// One server and the contiguous chunk of global clients it serves.
+struct ServerLink {
+  std::string addr;
+  size_t offset = 0, count = 0;  // global clients [offset, offset + count)
+  std::vector<std::unique_ptr<Conn>> conns;
+};
+
 } // namespace
 
 int main(int argc, char **argv) {
   Args args(argc, argv, kUsage);
-  const std::string server_addr = args.str("server");
+  const std::vector<std::string> server_addrs = split_list(args.str("server"));
   const uint64_t N = args.num("N");
   const uint32_t B = static_cast<uint32_t>(args.num("B"));
   const size_t C = args.num("C");
-  const size_t num_conns = std::max<size_t>(1, std::min<size_t>(C, args.num("connections", 16)));
+  const size_t conns_per_server = std::max<uint64_t>(1, args.num("connections", 16));
   const size_t threads = args.num("threads", std::max(1u, std::thread::hardware_concurrency()));
   const uint64_t seed = args.num("seed", std::random_device{}());
   const double timeout_sec = static_cast<double>(args.num("timeout", 3600));
@@ -110,24 +134,44 @@ int main(int argc, char **argv) {
     const RecordLayout layout = RecordLayout::make(N, B);
     const PirParams params(layout.num_real_pt, /*pow2_other_dim=*/true);
     const size_t width = ct_coeff_width(params);
-    const ShapeInfo expected{N, B, layout.records_per_pt, params.get_num_pt(),
-                             params.get_fst_dim_sz(), params.get_num_dims(), C};
     if (demo && static_cast<uint64_t>(demo_index) >= N)
       throw std::invalid_argument("--demo-index out of range");
+    const size_t P = server_addrs.size();
+    if (C < P) throw std::invalid_argument("need at least one client per server");
 
-    // ---- connect (the server may still be starting)
-    std::vector<std::unique_ptr<Conn>> conns;
-    for (size_t i = 0; i < num_conns; ++i) {
-      conns.push_back(connect_retry(server_addr, 600));
-      FrameHeader h;
-      std::vector<uint8_t> payload;
-      if (!conns.back()->recv_frame(h, payload) ||
-          static_cast<FrameType>(h.type) != FrameType::Params)
-        throw std::runtime_error("server did not send parameters");
-      if (!(decode_shape(payload) == expected))
-        throw std::runtime_error("server PIR shape differs from the client's "
-                                 "(check N, B, C and the build config)");
+    // ---- split clients across servers and connect (servers may still be starting)
+    const std::vector<size_t> offsets = split_clients(C, P);
+    std::vector<ServerLink> servers(P);
+    std::vector<uint32_t> server_of(C), local_id(C);
+    for (size_t s = 0; s < P; ++s) {
+      ServerLink &sv = servers[s];
+      sv.addr = server_addrs[s];
+      sv.offset = offsets[s];
+      sv.count = offsets[s + 1] - offsets[s];
+      for (size_t i = sv.offset; i < sv.offset + sv.count; ++i) {
+        server_of[i] = static_cast<uint32_t>(s);
+        local_id[i] = static_cast<uint32_t>(i - sv.offset);
+      }
+      const ShapeInfo expected{N, B, layout.records_per_pt, params.get_num_pt(),
+                               params.get_fst_dim_sz(), params.get_num_dims(), sv.count};
+      for (size_t k = 0; k < std::min(conns_per_server, sv.count); ++k) {
+        sv.conns.push_back(connect_retry(sv.addr, 600));
+        FrameHeader h;
+        std::vector<uint8_t> payload;
+        if (!sv.conns.back()->recv_frame(h, payload) ||
+            static_cast<FrameType>(h.type) != FrameType::Params)
+          throw std::runtime_error("server " + sv.addr + " did not send parameters");
+        if (!(decode_shape(payload) == expected))
+          throw std::runtime_error("server " + sv.addr + " PIR shape differs from the "
+                                   "client's (check N, B, C, the server list order and "
+                                   "the build config)");
+      }
     }
+    // Frames carry the client's index within its server's chunk.
+    auto conn_of = [&](size_t i) -> Conn & {
+      ServerLink &sv = servers[server_of[i]];
+      return *sv.conns[local_id[i] % sv.conns.size()];
+    };
     std::cout << "Layout: N=" << N << " RecordBytes=" << B
               << " records/plaintext=" << layout.records_per_pt
               << " plaintexts=" << params.get_num_pt()
@@ -170,23 +214,24 @@ int main(int argc, char **argv) {
     };
 
     // ---- one reader per connection
-    for (auto &conn : conns) {
-      std::thread([&, c = conn.get()] {
+    for (auto &sv : servers) for (auto &conn : sv.conns) {
+      std::thread([&, c = conn.get(), offset = sv.offset, count = sv.count] {
         try {
           FrameHeader h;
           std::vector<uint8_t> payload;
           while (c->recv_frame(h, payload)) {
-            if (h.client_id >= C) throw std::runtime_error("bad client id from server");
+            if (h.client_id >= count) throw std::runtime_error("bad client id from server");
+            const uint32_t gid = static_cast<uint32_t>(offset + h.client_id);
             switch (static_cast<FrameType>(h.type)) {
             case FrameType::KeysAck: {
-              clients[h.client_id].offline_end = Clock::now();
+              clients[gid].offline_end = Clock::now();
               std::lock_guard<std::mutex> lock(mu);
               ++acks;
               cv.notify_all();
               break;
             }
             case FrameType::Result: {
-              const uint32_t cid = h.client_id;
+              const uint32_t cid = gid;
               clients[cid].result_bytes = kFrameHeaderBytes + payload.size();
               pool.submit([&, cid, p = std::move(payload)]() mutable {
                 try {
@@ -231,7 +276,7 @@ int main(int argc, char **argv) {
       ByteWriter w;
       write_galois_keys(w, cl.pir->create_bv_galois_keys(), width);
       write_gsw(w, cl.pir->generate_gsw_from_key(), width);
-      cl.key_bytes = conns[i % num_conns]->send_frame(FrameType::Keys, static_cast<uint32_t>(i), w.buf);
+      cl.key_bytes = conn_of(i).send_frame(FrameType::Keys, local_id[i], w.buf);
     });
     wait_for(acks, "key acknowledgements");
     std::cout << "MILESTONE: offline phase complete" << std::endl;
@@ -243,13 +288,13 @@ int main(int argc, char **argv) {
       cl.query_start = Clock::now();
       ByteWriter w;
       write_ct(w, cl.pir->fast_generate_query(layout.pt_of(cl.index)), width);
-      cl.query_bytes = conns[i % num_conns]->send_frame(FrameType::Query, static_cast<uint32_t>(i), w.buf);
+      cl.query_bytes = conn_of(i).send_frame(FrameType::Query, local_id[i], w.buf);
       cl.query_sent = Clock::now();
     });
     std::cout << "MILESTONE: queries uploaded; waiting for results" << std::endl;
     wait_for(done, "results");
     std::cout << "MILESTONE: all results received" << std::endl;
-    for (auto &conn : conns) conn->shutdown();
+    for (auto &sv : servers) for (auto &conn : sv.conns) conn->shutdown();
 
     // ---- report (mirrors Zealot's "=== Performance Metrics ===" block)
     std::vector<double> offline, upload, e2e, wait, gen, dec;
@@ -270,8 +315,15 @@ int main(int argc, char **argv) {
     }
     const double Cd = static_cast<double>(C);
     std::cout << "\n=== Performance Metrics ===\n"
-              << "Scheme: OnionPIR (single server, streamed uncooperative database)\n"
-              << "Clients: " << C << "\n"
+              << "Scheme: OnionPIR (" << P << (P == 1 ? " server" : " servers")
+              << ", streamed uncooperative database)\n"
+              << "Clients: " << C << "\n";
+    if (P > 1) {
+      std::cout << "Clients per server:";
+      for (const auto &sv : servers) std::cout << " " << sv.count;
+      std::cout << "\n";
+    }
+    std::cout
               << "Layout: N=" << N << " RecordBytes=" << B
               << " records/plaintext=" << layout.records_per_pt
               << " plaintexts=" << params.get_num_pt()

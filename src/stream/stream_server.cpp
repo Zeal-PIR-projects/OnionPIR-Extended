@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstring>
 #include <chrono>
 #include <future>
 #include <iomanip>
@@ -107,6 +108,15 @@ void StreamPirServer::add_keys(uint32_t client_id,
   cl.gsw_key = std::move(gsw_key);
   cl.has_keys = true;
   ++keys_received_;
+}
+
+void StreamPirServer::attach_relay(std::shared_ptr<Conn> conn) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!opts_.db_addr.empty())
+    throw std::invalid_argument("relay offered to the database streamer");
+  if (relay_in_) throw std::invalid_argument("duplicate relay connection");
+  relay_in_ = std::move(conn);
+  cv_.notify_all();
 }
 
 void StreamPirServer::add_query(uint32_t client_id, RlweCt query, Reply reply) {
@@ -348,20 +358,84 @@ void StreamPirServer::run_round() {
   report_.records = layout_.num_records;
   report_.db_mbytes = static_cast<double>(layout_.num_records) * B / 1e6;
 
-  // Stream [0, N) once. The next chunk downloads (Go bridge + this reader
+  // Stream [0, N) once, from the database (the streamer) or from the next
+  // server's relay, forwarding every batch to the previous server as soon as
+  // it arrives. The next chunk downloads (Go bridge / relay + this reader
   // thread) while the pool computes on the current one.
   const auto connect_start = Clock::now();
-  DbRecordStream db(opts_.db_addr, 0, static_cast<uint32_t>(layout_.num_records),
-                    opts_.db_batch_records, static_cast<uint32_t>(B),
-                    opts_.db_connect_timeout_sec);
+  std::unique_ptr<DbRecordStream> db;
+  std::shared_ptr<Conn> upstream;
+  if (!opts_.db_addr.empty()) {
+    db = std::make_unique<DbRecordStream>(
+        opts_.db_addr, 0, static_cast<uint32_t>(layout_.num_records),
+        opts_.db_batch_records, static_cast<uint32_t>(B),
+        opts_.db_connect_timeout_sec);
+  } else {
+    std::unique_lock<std::mutex> lock(mu_);
+    if (!cv_.wait_for(lock, std::chrono::seconds(opts_.relay_timeout_sec),
+                      [&] { return relay_in_ != nullptr; }))
+      throw std::runtime_error("timed out waiting for the database relay");
+    upstream = relay_in_;
+  }
+  std::unique_ptr<Conn> downstream;
+  if (!opts_.relay_to.empty()) {
+    downstream = connect_retry(opts_.relay_to, opts_.db_connect_timeout_sec);
+    FrameHeader h;
+    std::vector<uint8_t> payload;
+    if (!downstream->recv_frame(h, payload) ||
+        static_cast<FrameType>(h.type) != FrameType::Params)
+      throw std::runtime_error("relay target did not send parameters");
+    const ShapeInfo mine{layout_.num_records, B, rpp, params_.get_num_pt(), n_,
+                         params_.get_num_dims(), clients_.size()};
+    if (!same_layout(decode_shape(payload), mine))
+      throw std::runtime_error("relay target " + opts_.relay_to +
+                               " has a different database layout");
+    downstream->send_frame(FrameType::RelayOpen, 0, nullptr, 0);
+  }
   report_.db_connect_ms = ms_since(connect_start);
+
+  // Relay batches of at most 4 MiB, so the previous server starts on a chunk
+  // while this one is still receiving it.
+  const uint64_t relay_batch = std::max<uint64_t>(1, (uint64_t{4} << 20) / B);
+  std::vector<uint8_t> relay_buf;
+  size_t relay_pos = 0;
+  auto read_relay = [&](uint8_t *dst, uint64_t bytes) {
+    while (bytes > 0) {
+      if (relay_pos == relay_buf.size()) {
+        FrameHeader h;
+        if (!upstream->recv_frame(h, relay_buf))
+          throw std::runtime_error("database relay closed early");
+        if (static_cast<FrameType>(h.type) != FrameType::RelayRecords)
+          throw std::runtime_error("unexpected frame on the database relay");
+        relay_pos = 0;
+        continue;
+      }
+      const size_t n = std::min<uint64_t>(bytes, relay_buf.size() - relay_pos);
+      std::memcpy(dst, relay_buf.data() + relay_pos, n);
+      relay_pos += n;
+      dst += n;
+      bytes -= n;
+    }
+  };
+
   const size_t chunk_pts = chunk_rows_ * n_;
   std::vector<uint8_t> raw[2] = {std::vector<uint8_t>(chunk_pts * rpp * B),
                                  std::vector<uint8_t>(chunk_pts * rpp * B)};
   auto fill = [&](size_t k, uint8_t *dst) {
     const uint64_t first = static_cast<uint64_t>(k) * chunk_pts * rpp;
     const uint64_t last = std::min<uint64_t>(first + chunk_pts * rpp, layout_.num_records);
-    db.read_exact(dst, last - first);
+    for (uint64_t at = first; at < last;) {
+      const uint64_t n = std::min(relay_batch, last - at);
+      uint8_t *p = dst + (at - first) * B;
+      if (db) db->read_exact(p, n);
+      else read_relay(p, n * B);
+      if (downstream) {
+        const auto t0 = Clock::now();
+        downstream->send_frame(FrameType::RelayRecords, 0, p, n * B);
+        report_.relay_send_ms += ms_since(t0);
+      }
+      at += n;
+    }
   };
 
   const auto stream_start = Clock::now();
@@ -434,9 +508,16 @@ void StreamPirServer::print_report(std::ostream &os) const {
      << "    expansion CPU total (all threads): " << cpu(report_.expand_us) << "\n"
      << "    RGSW conversion CPU total (all threads): " << cpu(report_.convert_us) << "\n"
      << "    first-dim query prep CPU total (all threads): " << cpu(report_.fst_prep_us) << "\n"
-     << "  Database connect + StreamRecords open: " << ms(report_.db_connect_ms) << "\n"
+     << "  Record source: "
+     << (opts_.db_addr.empty() ? "relay from the next server"
+                               : "database " + opts_.db_addr + " (database streamer)")
+     << "; forwarding to: " << (opts_.relay_to.empty() ? "none" : opts_.relay_to) << "\n"
+     << (opts_.db_addr.empty() ? "  Wait for the next server's relay: "
+                               : "  Database connect + StreamRecords open: ")
+     << ms(report_.db_connect_ms) << "\n"
      << "  Database pass wall (stream + compute): " << ms(report_.stream_wall_ms) << "\n"
      << "    blocked waiting on database stream: " << ms(report_.db_wait_ms) << "\n"
+     << "    forwarding to the previous server (overlaps compute): " << ms(report_.relay_send_ms) << "\n"
      << "    record packing + NTT encode: " << ms(report_.encode_ms) << "\n"
      << "    batched first-dim product: " << ms(report_.matmul_ms) << "\n"
      << "    row ciphertexts (CRT + INTT): " << ms(report_.leaves_ms) << "\n"

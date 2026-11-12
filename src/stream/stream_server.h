@@ -22,6 +22,13 @@
 // client's selector for each bit. Only O(h) ciphertexts per client are live,
 // and all-zero padding rows (PirParams pow2_other_dim) are never computed.
 //
+// Several servers. Clients are split into contiguous chunks, one per server,
+// and each server runs this round for its own chunk; the PIR protocol is
+// unchanged. Like Zealot's proxies, only the database streamer (the last
+// server) reads the database; every server forwards the raw records it
+// receives to the previous server (options.relay_to) as it reads them, so the
+// database is read once per round however many servers there are.
+//
 // Only the composite first-dimension config (CONFIG_N2048_K1_COMP, the
 // default) is supported.
 
@@ -32,6 +39,7 @@
 #include "record_codec.h"
 #include "rlwe.h"
 #include "thread_pool.h"
+#include "wire.h"
 
 #include <atomic>
 #include <chrono>
@@ -47,7 +55,11 @@
 namespace stream {
 
 struct StreamServerOptions {
-  std::string db_addr;            // uncooperative database, host:port
+  // Record source: the uncooperative database (host:port), or, when empty,
+  // the relay from the next server (which connects and sends RelayOpen).
+  std::string db_addr;
+  std::string relay_to;           // previous server to forward records to; "" = none
+  uint32_t relay_timeout_sec = 3600;  // wait for the next server's relay
   size_t num_clients = 1;         // C: queries per round
   size_t threads = 0;             // 0 = hardware concurrency
   size_t chunk_rows = 64;         // first-dim rows per streamed chunk (pow2)
@@ -69,6 +81,9 @@ public:
   // Thread-safe. Preprocessing runs asynchronously on the pool; `reply` is
   // invoked from a pool thread with the serialized response.
   void add_query(uint32_t client_id, RlweCt query, Reply reply);
+  // Thread-safe. Hands over the connection on which the next server relays
+  // the database (after its RelayOpen frame). Only when db_addr is empty.
+  void attach_relay(std::shared_ptr<Conn> conn);
 
   // Blocks until all C queries are preprocessed, then streams the database
   // and replies to every client.
@@ -130,13 +145,15 @@ private:
   std::condition_variable cv_;
   size_t keys_received_ = 0, queries_received_ = 0, preprocessed_ = 0;
   std::string preprocess_error_;
+  std::shared_ptr<Conn> relay_in_;  // from the next server, if relayed
 
   // Report. CPU totals (summed across threads) are labeled as such; the rest
   // are wall-clock times of the round's critical path.
   struct Report {
     double first_query_to_ready_ms = 0;  // wall: first query -> all preprocessed
     std::atomic<uint64_t> expand_us{0}, convert_us{0}, fst_prep_us{0};  // CPU
-    double db_connect_ms = 0;
+    double db_connect_ms = 0;  // database open, or wait for the relay
+    double relay_send_ms = 0;  // forwarding to relay_to (reader thread)
     double stream_wall_ms = 0, db_wait_ms = 0, encode_ms = 0, matmul_ms = 0,
            leaves_ms = 0, merge_ms = 0, finish_ms = 0, round_wall_ms = 0;
     size_t chunks = 0, real_rows = 0, records = 0;

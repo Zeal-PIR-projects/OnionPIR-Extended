@@ -26,6 +26,12 @@ public:
     if (def.empty()) fail("missing --" + key);
     return def;
   }
+  // Optional string flag: "" when absent.
+  std::string opt(const std::string &key) {
+    used_[key] = true;
+    auto it = values_.find(key);
+    return it == values_.end() ? "" : it->second;
+  }
   uint64_t num(const std::string &key, int64_t def = -1) {
     used_[key] = true;
     auto it = values_.find(key);

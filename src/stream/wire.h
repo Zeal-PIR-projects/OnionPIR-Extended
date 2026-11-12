@@ -3,7 +3,13 @@
 // bit-packed serialization of the key material, queries, and responses.
 //
 // Many simulated clients share a few connections (like Zealot's clients
-// share gRPC channels); every frame carries the logical client id.
+// share gRPC channels); every frame carries the logical client id, which is
+// the client's index within the chunk of clients assigned to that server.
+//
+// With several servers, the same transport carries the database relay
+// (Zealot's ForwardRows): the database streamer (the last server) reads the
+// database once, and each server forwards the raw records, unencrypted and
+// unchanged, to the server before it. Relay frames never reach clients.
 
 #include "bv_keyswitch.h"
 #include "gsw.h"
@@ -24,6 +30,8 @@ enum class FrameType : uint32_t {
   Query = 4,    // client -> server: packed query ciphertext (online)
   Result = 5,   // server -> client: mod-switched response
   Error = 6,    // either direction: UTF-8 message
+  RelayOpen = 7,   // server -> previous server: start of the database relay
+  RelayRecords = 8,  // server -> previous server: a batch of raw records, in order
 };
 
 struct FrameHeader {
@@ -110,5 +118,20 @@ struct ShapeInfo {
 };
 std::vector<uint8_t> encode_shape(const ShapeInfo &s);
 ShapeInfo decode_shape(const std::vector<uint8_t> &payload);
+// Same database layout and PIR shape; client counts may differ per server.
+inline bool same_layout(ShapeInfo a, const ShapeInfo &b) {
+  a.num_clients = b.num_clients;
+  return a == b;
+}
+
+// Contiguous split of C clients across P servers: server s serves global
+// clients [offsets[s], offsets[s+1]). The first C % P servers get one extra.
+// scripts/experiment.py split_clients() must agree.
+inline std::vector<size_t> split_clients(size_t C, size_t P) {
+  std::vector<size_t> offsets(P + 1, 0);
+  for (size_t s = 0; s < P; ++s)
+    offsets[s + 1] = offsets[s] + C / P + (s < C % P ? 1 : 0);
+  return offsets;
+}
 
 } // namespace stream

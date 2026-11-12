@@ -3,6 +3,10 @@
 // Serves one round of C concurrent clients: collects key material and one
 // query per client, streams the Zealot/shuffle database once, and returns
 // every client's encrypted record. See src/stream/stream_server.h.
+//
+// With several servers, each serves its own chunk of clients. Exactly one
+// (the database streamer) takes --db; the others receive the records from the
+// next server's relay. --relay-to forwards them on to the previous server.
 
 #include "args.h"
 #include "record_codec.h"
@@ -18,11 +22,16 @@
 
 using namespace stream;
 
-static const char *kUsage = R"(usage: onion_server --db HOST:PORT --N RECORDS --B RECORD_BYTES --C CLIENTS
+static const char *kUsage = R"(usage: onion_server --N RECORDS --B RECORD_BYTES --C CLIENTS
+                    [--db HOST:PORT] [--relay-to HOST:PORT] [--relay-timeout SEC]
                     [--listen HOST:PORT] [--threads T] [--chunk-rows M]
                     [--db-batch RECORDS] [--db-timeout SEC]
-  --db          uncooperative database (shuffle cmd/testserver), the config's ServerAddr
-  --N --B --C   database records, bytes per record (RecordBytes), clients per round
+  --db          uncooperative database (shuffle cmd/testserver), the config's ServerAddr.
+                Only the database streamer takes it; without it, the server waits
+                for the next server to relay the records
+  --relay-to    previous server's --listen address: forward the records to it
+  --relay-timeout  seconds to wait for the next server's relay (default 3600)
+  --N --B --C   database records, bytes per record (RecordBytes), this server's clients
   --listen      address for clients (default 0.0.0.0:10001)
   --threads     worker threads (default: all cores)
   --chunk-rows  first-dimension rows per streamed chunk, power of two (default 64)
@@ -32,7 +41,8 @@ static const char *kUsage = R"(usage: onion_server --db HOST:PORT --N RECORDS --
 int main(int argc, char **argv) {
   Args args(argc, argv, kUsage);
   StreamServerOptions opts;
-  opts.db_addr = args.str("db");
+  opts.db_addr = args.opt("db");
+  opts.relay_to = args.opt("relay-to");
   const uint64_t N = args.num("N");
   const uint32_t B = static_cast<uint32_t>(args.num("B"));
   opts.num_clients = args.num("C");
@@ -41,6 +51,7 @@ int main(int argc, char **argv) {
   opts.chunk_rows = args.num("chunk-rows", 64);
   opts.db_batch_records = static_cast<uint32_t>(args.num("db-batch", 4096));
   opts.db_connect_timeout_sec = static_cast<uint32_t>(args.num("db-timeout", 300));
+  opts.relay_timeout_sec = static_cast<uint32_t>(args.num("relay-timeout", 3600));
   args.finish();
   if (N > UINT32_MAX) {
     std::cerr << "N must fit the database's uint32 record indices\n";
@@ -71,7 +82,10 @@ int main(int argc, char **argv) {
     const size_t width = ct_coeff_width(params);
     const int listen_fd = listen_on(listen_addr);
     std::cout << "OnionPIR server listening on " << listen_addr << ", waiting for "
-              << opts.num_clients << " clients" << std::endl;
+              << opts.num_clients << " clients; records from "
+              << (opts.db_addr.empty() ? "the next server's relay" : opts.db_addr)
+              << (opts.relay_to.empty() ? "" : ", relaying to " + opts.relay_to)
+              << std::endl;
 
     std::atomic<size_t> open_conns{0};
     std::thread acceptor([&] {
@@ -83,7 +97,8 @@ int main(int argc, char **argv) {
           try {
             FrameHeader h;
             std::vector<uint8_t> payload;
-            while (conn->recv_frame(h, payload)) {
+            bool relay = false;
+            while (!relay && conn->recv_frame(h, payload)) {
               ByteReader r(payload.data(), payload.size());
               switch (static_cast<FrameType>(h.type)) {
               case FrameType::Keys: {
@@ -101,6 +116,12 @@ int main(int argc, char **argv) {
                                  });
                 break;
               }
+              case FrameType::RelayOpen:
+                // The rest of this connection is the database relay, read by
+                // the round itself.
+                server.attach_relay(conn);
+                relay = true;
+                break;
               default:
                 throw std::runtime_error("unexpected frame type " + std::to_string(h.type));
               }

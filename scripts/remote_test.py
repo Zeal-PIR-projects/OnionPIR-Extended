@@ -7,13 +7,19 @@ database service.
 
 Topology (from the AWS config, shuffle's format):
   serverInstance        the uncooperative database (shuffle cmd/testserver)
-  onionServerInstance   the OnionPIR server; defaults to the last entry of
-                        proxyInstances (Zealot's database streamer host)
-  clientInstance        the C simulated clients; defaults to the OnionPIR
-                        server host when absent
+  proxyInstances        one OnionPIR server per proxy, like Zealot's proxies.
+                        Server i listens on ProxyAddresses[i]'s port and serves
+                        the i-th contiguous chunk of the C clients. The last
+                        one is the database streamer: it alone reads the
+                        database, and each server relays the records to the
+                        one before it.
+  onionServerInstance   optional: a single OnionPIR server instead (it takes
+                        the last ProxyAddresses port, as before)
+  clientInstance        the C simulated clients; defaults to the database
+                        streamer's host when absent
 Optional deployment knobs (AWS config, like zealotXORWorkers):
   onionThreads (0 = all cores), onionChunkRows (64), onionDbBatch (4096),
-  onionConnections (16), hexlPrefix (/opt/hexl)
+  onionConnections (16, per server), hexlPrefix (/opt/hexl)
 
   python3 scripts/remote_test.py --aws-config ../shuffle/awsConfigs/c8i16xlarge.json \\
       --config ../shuffle/testFiles/fromPaper/row1.json --C 100
@@ -115,16 +121,24 @@ def build_onion_command(repo, shuffle, hexl_prefix):
 
 
 def resolve_hosts(aws):
-    """Return {label: instance_id} for database, server and (if separate) client."""
-    db_id = aws["serverInstance"]
-    onion_id = aws.get("onionServerInstance") or (aws.get("proxyInstances") or [None])[-1]
-    if not onion_id:
-        raise ValueError("AWS config needs onionServerInstance (or proxyInstances)")
-    client_id = aws.get("clientInstance") or onion_id
-    hosts = {"database": db_id, "server": onion_id}
-    if client_id != onion_id:
+    """Return {label: instance_id}: database, server0..server{P-1} (in chain
+    order; the last streams the database) and, if separate, client."""
+    servers = [aws["onionServerInstance"]] if aws.get("onionServerInstance") \
+        else list(aws.get("proxyInstances") or [])
+    if not servers:
+        raise ValueError("AWS config needs proxyInstances (or onionServerInstance)")
+    if len(set(servers)) != len(servers):
+        raise ValueError("each OnionPIR server needs its own instance")
+    hosts = {"database": aws["serverInstance"]}
+    hosts.update({f"server{i}": iid for i, iid in enumerate(servers)})
+    client_id = aws.get("clientInstance") or servers[-1]
+    if client_id not in servers:
         hosts["client"] = client_id
     return hosts
+
+
+def server_ids(hosts):
+    return [iid for label, iid in hosts.items() if label.startswith("server")]
 
 
 def build_all(ssm, hosts, remote_repo, remote_shuffle, hexl_prefix):
@@ -176,8 +190,9 @@ def main():
     config = ex.load_config(ex.resolve(args.config, os.getcwd()), args.N, args.C, args.B)
 
     hosts = resolve_hosts(aws)
-    db_id, onion_id = hosts["database"], hosts["server"]
-    client_id = hosts.get("client", onion_id)
+    db_id, onion_ids = hosts["database"], server_ids(hosts)
+    client_id = hosts.get("client", onion_ids[-1])
+    counts = ex.split_clients(config["C"], len(onion_ids))
     knobs = {"threads": aws.get("onionThreads", 0), "chunk_rows": aws.get("onionChunkRows", 64),
              "db_batch": aws.get("onionDbBatch", 4096), "connections": aws.get("onionConnections", 16)}
     for key, value in knobs.items():
@@ -187,9 +202,9 @@ def main():
 
     session = boto3.Session(region_name=args.region or aws.get("region"))
     ec2, ssm = session.client("ec2"), session.client("ssm")
-    db_ip, onion_ip = private_ip(ec2, db_id), private_ip(ec2, onion_id)
-    db_addr = f"{db_ip}:{ex.database_port(config)}"
-    onion_addr = f"{onion_ip}:{ex.onion_port(config)}"
+    db_addr = f"{private_ip(ec2, db_id)}:{ex.database_port(config)}"
+    ports = ex.onion_ports(config, len(onion_ids))
+    onion_addrs = [f"{private_ip(ec2, iid)}:{port}" for iid, port in zip(onion_ids, ports)]
     # The database reads only N, RecordBytes and ServerAddr, but parses the
     # whole shuffle config; keep it a valid one with the real address.
     db_config = dict(config, ServerAddr=f"0.0.0.0:{ex.database_port(config)}")
@@ -202,8 +217,11 @@ def main():
     print("==> OnionPIR streaming experiment (AWS)")
     print(f"  {ex.describe(config)}")
     print(f"  database {db_id} {db_addr}")
-    print(f"  OnionPIR server {onion_id} {onion_addr}")
-    print(f"  clients {client_id}" + (" (co-located with the server)" if client_id == onion_id else ""))
+    for i, (iid, addr) in enumerate(zip(onion_ids, onion_addrs)):
+        role = "  (database streamer)" if i == len(onion_ids) - 1 else ""
+        print(f"  OnionPIR server {i} {iid} {addr}: {counts[i]} clients{role}")
+    print(f"  clients {client_id}" + (" (co-located with the database streamer)"
+                                      if client_id == onion_ids[-1] else ""))
     print(f"  knobs {knobs}")
     q = shlex.quote
     encoded = base64.b64encode(json.dumps(db_config, indent=2).encode()).decode()
@@ -230,46 +248,56 @@ def main():
             f"nohup {PREFIX}_db --config {REMOTE_CONFIG} > {PREFIX}_db.log 2>&1 &"], comment="onionpir-start-db"))
         time.sleep(2)
 
-        print("==> Starting OnionPIR server...")
-        server_cmd = " ".join(q(a) for a in [f"{PREFIX}_server"] + ex.server_flags(
-            config, db_addr, f"0.0.0.0:{ex.onion_port(config)}", knobs["threads"], knobs["chunk_rows"],
-            knobs["db_batch"]))
-        require("start server", ssm_run(ssm, onion_id, [
-            f"nohup {server_cmd} > {PREFIX}_server.log 2>&1 &"], comment="onionpir-start-server"))
-        deadline = time.time() + 300
-        while True:
-            _, status, _ = ssm_run(ssm, onion_id, [
-                f"if grep -q 'listening on' {PREFIX}_server.log; then echo READY; "
-                f"elif ! pgrep -f '{PREFIX}_server ' >/dev/null; then echo EXITED; tail -n 30 {PREFIX}_server.log; fi"],
-                timeout=60, comment="onionpir-check-server")
-            if status.startswith("READY"):
-                break
-            if status.startswith("EXITED") or time.time() > deadline:
-                raise RuntimeError(f"OnionPIR server did not start:\n{status}")
-            time.sleep(3)
+        print(f"==> Starting {len(onion_ids)} OnionPIR server(s)...")
+        all_flags = ex.all_server_flags(
+            config, [f"0.0.0.0:{port}" for port in ports], onion_addrs, db_addr,
+            threads=knobs["threads"], chunk_rows=knobs["chunk_rows"], db_batch=knobs["db_batch"])
+        for i, (iid, flags) in enumerate(zip(onion_ids, all_flags)):
+            server_cmd = " ".join(q(a) for a in [f"{PREFIX}_server"] + flags)
+            require(f"start server {i}", ssm_run(ssm, iid, [
+                f"nohup {server_cmd} > {PREFIX}_server.log 2>&1 &"], comment="onionpir-start-server"))
+
+        def wait_listening(i, iid):
+            deadline = time.time() + 300
+            while True:
+                _, status, _ = ssm_run(ssm, iid, [
+                    f"if grep -q 'listening on' {PREFIX}_server.log; then echo READY; "
+                    f"elif ! pgrep -f '{PREFIX}_server ' >/dev/null; then echo EXITED; "
+                    f"tail -n 30 {PREFIX}_server.log; fi"], timeout=60, comment="onionpir-check-server")
+                if status.startswith("READY"):
+                    return None
+                if status.startswith("EXITED") or time.time() > deadline:
+                    return f"OnionPIR server {i} ({iid}) did not start:\n{status}"
+                time.sleep(3)
+        errors = run_parallel({i: (lambda i=i, iid=iid: wait_listening(i, iid))
+                               for i, iid in enumerate(onion_ids)})
+        failures = [errors[i] for i in sorted(errors) if errors[i]]
+        if failures:
+            raise RuntimeError("\n".join(failures))
 
         print("==> Running clients...")
         client_cmd = " ".join(q(a) for a in [f"{PREFIX}_client"] + ex.client_flags(
-            config, onion_addr, knobs["connections"], 0, args.timeout, args.demo_index))
+            config, onion_addrs, knobs["connections"], 0, args.timeout, args.demo_index))
         started = time.time()
         status, stdout, _ = ssm_run(ssm, client_id, [
             f"{client_cmd} > {PREFIX}_client.log 2>&1; echo EXIT:$?"],
             timeout=args.timeout + 120, comment="onionpir-run-client")
         elapsed = time.time() - started
         time.sleep(1)  # server prints its report after the last reply
-        logs = {}
-        for label, iid, name in [("client", client_id, "client"), ("server", onion_id, "server"),
-                                 ("database", db_id, "db")]:
-            logs[label] = ssm_run(ssm, iid, [f"cat {PREFIX}_{name}.log 2>/dev/null || true"],
-                                  comment=f"onionpir-log-{label}")[1]
+        sources = [("client", client_id, "client"), ("database", db_id, "db")] + \
+            [(f"server{i}", iid, "server") for i, iid in enumerate(onion_ids)]
+        logs = run_parallel({label: (lambda iid=iid, name=name: ssm_run(
+            ssm, iid, [f"cat {PREFIX}_{name}.log 2>/dev/null || true"],
+            comment=f"onionpir-log-{name}")[1]) for label, iid, name in sources})
         client_ok = status == "Success" and "EXIT:0" in stdout
 
         out("\n================ TEST RESULT ================")
         out("\n--- Experiment Parameters ---")
         out(f"  N={config['N']}  C={config['C']}  RecordBytes={config['RecordBytes']}  "
             f"(database {config['N'] * config['RecordBytes'] / 1e6:.1f} MB)")
-        out(f"  ServerAddr(database)={db_addr}  OnionPIR server={onion_addr}  "
-            f"clients on {'server host' if client_id == onion_id else client_id}")
+        out(f"  ServerAddr(database)={db_addr}  OnionPIR servers={','.join(onion_addrs)} "
+            f"(last streams the database)  clients per server={counts}  "
+            f"clients on {'database streamer host' if client_id == onion_ids[-1] else client_id}")
         out(f"  onionThreads={knobs['threads']}  onionChunkRows={knobs['chunk_rows']}  "
             f"onionDbBatch={knobs['db_batch']}  onionConnections={knobs['connections']}")
         out(f"  client process wall time: {elapsed:.1f}s")
@@ -278,8 +306,11 @@ def main():
         out()
         out((client_log[at:] if at >= 0 else client_log).rstrip())
         out("\n=== Server/Database Timing Breakdown ===")
-        out(ex.section(logs["server"], "=== OnionPIR streaming server timing ===").rstrip()
-            or "  server timing report not yet written")
+        for i in range(len(onion_ids)):
+            if len(onion_ids) > 1:
+                out(f"--- OnionPIR server {i} ---")
+            out(ex.section(logs[f"server{i}"], "=== OnionPIR streaming server timing ===").rstrip()
+                or "  server timing report not yet written")
         out("--- database ---")
         out(ex.database_timing(logs["database"]).rstrip())
         out("PASS" if client_ok else "FAIL")
