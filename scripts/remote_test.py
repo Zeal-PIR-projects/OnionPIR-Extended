@@ -114,6 +114,46 @@ def build_onion_command(repo, shuffle, hexl_prefix):
             f"grep -q avx512f /proc/cpuinfo && echo CPU:avx512 || echo CPU:no-avx512; echo BUILD_OK")
 
 
+def resolve_hosts(aws):
+    """Return {label: instance_id} for database, server and (if separate) client."""
+    db_id = aws["serverInstance"]
+    onion_id = aws.get("onionServerInstance") or (aws.get("proxyInstances") or [None])[-1]
+    if not onion_id:
+        raise ValueError("AWS config needs onionServerInstance (or proxyInstances)")
+    client_id = aws.get("clientInstance") or onion_id
+    hosts = {"database": db_id, "server": onion_id}
+    if client_id != onion_id:
+        hosts["client"] = client_id
+    return hosts
+
+
+def build_all(ssm, hosts, remote_repo, remote_shuffle, hexl_prefix):
+    """Regenerate shuffle protobuf code, then build the database (shuffle
+    testserver) and the OnionPIR server/client binaries, all in parallel."""
+    q = shlex.quote
+    print("==> Regenerating shuffle protobuf code...")
+    results = run_parallel({label: (lambda iid=iid: ssm_run(ssm, iid, [proto_command(remote_shuffle)],
+                                                           timeout=180, comment="onionpir-proto"))
+                            for label, iid in hosts.items()})
+    for label, result in results.items():
+        require(f"proto regeneration on {label}", result, "PROTO_OK")
+
+    print("==> Building (database: shuffle testserver; server/client: OnionPIR + HEXL)...")
+    jobs = {"database": lambda: ssm_run(ssm, hosts["database"], [
+        f"{GO_ENV} && cd {q(remote_shuffle)} && go build -buildvcs=false -o {PREFIX}_db ./cmd/testserver "
+        f"&& echo BUILD_OK"], timeout=900, comment="onionpir-build-db")}
+    for label, iid in hosts.items():
+        if label != "database":
+            jobs[label] = (lambda iid=iid: ssm_run(ssm, iid, [build_onion_command(
+                remote_repo, remote_shuffle, hexl_prefix)], timeout=3600, comment="onionpir-build"))
+    results = run_parallel(jobs)
+    for label, result in results.items():
+        stdout = require(f"build {label}", result, "BUILD_OK")
+        if "CPU:no-avx512" in stdout:
+            print(f"  WARNING: {label} host has no AVX-512; the first-dim product uses the scalar path")
+    print("  build OK")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--aws-config", required=True, help="shuffle-format AWS config (instance ids, region)")
@@ -135,11 +175,9 @@ def main():
         aws = json.load(file)
     config = ex.load_config(ex.resolve(args.config, os.getcwd()), args.N, args.C, args.B)
 
-    db_id = aws["serverInstance"]
-    onion_id = aws.get("onionServerInstance") or (aws.get("proxyInstances") or [None])[-1]
-    if not onion_id:
-        raise ValueError("AWS config needs onionServerInstance (or proxyInstances)")
-    client_id = aws.get("clientInstance") or onion_id
+    hosts = resolve_hosts(aws)
+    db_id, onion_id = hosts["database"], hosts["server"]
+    client_id = hosts.get("client", onion_id)
     knobs = {"threads": aws.get("onionThreads", 0), "chunk_rows": aws.get("onionChunkRows", 64),
              "db_batch": aws.get("onionDbBatch", 4096), "connections": aws.get("onionConnections", 16)}
     for key, value in knobs.items():
@@ -155,10 +193,6 @@ def main():
     # The database reads only N, RecordBytes and ServerAddr, but parses the
     # whole shuffle config; keep it a valid one with the real address.
     db_config = dict(config, ServerAddr=f"0.0.0.0:{ex.database_port(config)}")
-    hosts = {"database": db_id, "server": onion_id}
-    if client_id != onion_id:
-        hosts["client"] = client_id
-    builders = {label: iid for label, iid in hosts.items() if label != "database"}
 
     report = []
     def out(text=""):
@@ -188,26 +222,7 @@ def main():
                     require(f"git pull {label} {repo}", ssm_run(ssm, iid, [as_ec2_user(
                         f"cd {q(repo)} && git pull --ff-only")], comment="onionpir-pull"))
 
-        print("==> Regenerating shuffle protobuf code...")
-        results = run_parallel({label: (lambda iid=iid: ssm_run(ssm, iid, [proto_command(args.remote_shuffle)],
-                                                               timeout=180, comment="onionpir-proto"))
-                                for label, iid in hosts.items()})
-        for label, result in results.items():
-            require(f"proto regeneration on {label}", result, "PROTO_OK")
-
-        print("==> Building (database: shuffle testserver; server/client: OnionPIR + HEXL)...")
-        jobs = {"database": lambda: ssm_run(ssm, db_id, [
-            f"{GO_ENV} && cd {q(args.remote_shuffle)} && go build -buildvcs=false -o {PREFIX}_db ./cmd/testserver "
-            f"&& echo BUILD_OK"], timeout=900, comment="onionpir-build-db")}
-        for label, iid in builders.items():
-            jobs[label] = (lambda iid=iid: ssm_run(ssm, iid, [build_onion_command(
-                args.remote_repo, args.remote_shuffle, hexl_prefix)], timeout=3600, comment="onionpir-build"))
-        results = run_parallel(jobs)
-        for label, result in results.items():
-            stdout = require(f"build {label}", result, "BUILD_OK")
-            if "CPU:no-avx512" in stdout:
-                print(f"  WARNING: {label} host has no AVX-512; the first-dim product uses the scalar path")
-        print("  build OK")
+        build_all(ssm, hosts, args.remote_repo, args.remote_shuffle, hexl_prefix)
 
         print("==> Starting database...")
         require("start database", ssm_run(ssm, db_id, [

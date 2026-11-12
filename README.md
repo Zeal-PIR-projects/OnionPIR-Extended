@@ -126,6 +126,11 @@ python3 scripts/local_test.py --config ../shuffle/testFiles/fromPaper/row1.json 
 ```bash
 python3 scripts/remote_test.py --aws-config ../shuffle/awsConfigs/c8i16xlarge.json \
     --config ../shuffle/testFiles/fromPaper/row1.json --C 100 --output outputs/row1_c100.txt
+
+# Like shuffle's cmd/update_remote.py: pull this repo on the server/client hosts
+python3 scripts/update_remote.py --aws-config ../shuffle/awsConfigs/c8i16xlarge.json [--branch my-feature]
+# Run only the build phase of remote_test.py (proto regen + database/server/client builds)
+python3 scripts/build_remote.py --aws-config ../shuffle/awsConfigs/c8i16xlarge.json
 ```
 
 Experiments are specified exactly as for Zealot: an AWS config plus a shuffle
