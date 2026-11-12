@@ -87,6 +87,15 @@ void level_mat_mat_32(const uint32_t *A_data, const uint32_t *B_data,
                       uint64_t *out_data, size_t m, size_t n, size_t levels,
                       uint64_t q);
 
+// Same product as level_mat_mat_32, but B is stored pre-split per level:
+//   B[level * 2n + k] = B0_k,  B[level * 2n + n + k] = B1_k
+// (instead of interleaved pairs), so no per-call deinterleave or allocation.
+// Used by the streaming server, which calls it once per (client, level block).
+// Output layout and the reduced-mod-q guarantee match level_mat_mat_32.
+void level_mat_mat_32_split(const uint32_t *A_data, const uint32_t *B_data,
+                            uint64_t *out_data, size_t m, size_t n,
+                            size_t levels, uint64_t q);
+
 // ======================== COMPONENT WISE MULTIPLICATION ========================
 
 // These are examples of component wise multiplication. This demonstrates the

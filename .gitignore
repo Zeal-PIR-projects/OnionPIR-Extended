@@ -30,3 +30,4 @@ claude_resp/
 codex_resp/
 .*
 overleaf/
+__pycache__/

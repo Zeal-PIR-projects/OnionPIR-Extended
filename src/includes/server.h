@@ -8,6 +8,25 @@
 #include <sstream>
 #include <unordered_map>
 
+// Stateless per-query server operations. PirServer delegates to these; the
+// streaming server (stream_server.h) calls them directly with per-thread
+// GSWEval instances, since GSWEval carries non-thread-safe scratch buffers.
+namespace server_ops {
+// Expand a packed query into fst_dim_sz + l*(num_dims-1) BFV ciphertexts.
+std::vector<RlweCt> fast_expand_qry(const PirParams &pir_params,
+                                    const bvks::BvGaloisKeys &bv_galois_key,
+                                    RlweCt &ciphertext);
+// result = b * (y - x) + x, with b encrypted in `selection_cipher`. Clobbers y.
+void ext_prod_mux(const PirParams &pir_params, GSWEval &data_gsw, RlweCt &x,
+                  RlweCt &y, GSWCt &selection_cipher, RlweCt &result);
+// Rescale a single-limb (or K=2, dropping q1) ciphertext to modulus q.
+void mod_switch_inplace(const PirParams &pir_params, RlweCt &ciphertext,
+                        const uint64_t q);
+// Bit-pack a mod-switched response; returns bytes written.
+size_t save_resp_to_stream(const PirParams &pir_params, const RlweCt &response,
+                           std::ostream &stream);
+} // namespace server_ops
+
 class PirServer {
 public:
   PirServer(const PirParams &pir_params);

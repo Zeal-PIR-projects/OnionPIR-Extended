@@ -46,6 +46,11 @@ public:
 
   // Decrypt a single-mod RlweCt under small_q using our custom decryptor.
   RlwePt decrypt_mod_q(const RlweCt &ciphertext) const;
+  // Noise budget (bits) measured by the last decrypt_mod_q call.
+  int last_noise_budget() const { return last_noise_budget_; }
+  // decrypt_mod_q prints its noise budget unless this is false (the
+  // multi-client load generator turns it off).
+  static inline bool print_noise_budget = true;
 
 
   friend class PirTest;
@@ -55,6 +60,7 @@ private:
   PirParams pir_params_;
   std::mt19937_64 rng_;       // per-client PRNG for noise sampling
   RlweSk rlwe_sk_;            // ternary sk, NTT form under q
+  mutable int last_noise_budget_ = 0;
 
   // Gets the query indices for a given plaintext
   std::vector<size_t> get_query_indices(size_t pt_idx);

@@ -10,6 +10,8 @@ We use c++20 and `GCC 11.4.0` for compilation.
 
 ### Installation
 
+On machines without AVX-512 (e.g. Apple Silicon), the first-dimension product uses an overflow-safe scalar path; set `HEXL_DIR` (env or `-DHEXL_DIR=`) to your HEXL install.
+
 OnionPIRv2 only depends on [Intel HEXL](https://github.com/intel/hexl) for fast NTT. The expected install path is set in the top-level `CMakeLists.txt` (`HEXL_DIR`) — adjust it to match your environment, or pass `-DHEXL_DIR=...` on the cmake line. Pass `-DUSE_HEXL=OFF` to build without HEXL (scalar fallback).
 
 ```
@@ -75,6 +77,77 @@ make && ./Onion-PIR --test pir
 ```
 
 
+
+## Multi-client streaming mode (uncooperative database)
+
+`onion_server` / `onion_client` run OnionPIR for **C concurrent clients** against an
+**uncooperative database** that the single server must stream every round. The
+database is the unmodified Go service from the Zealot/shuffle repository
+(`../shuffle`, `cmd/testserver`), reached through its own gRPC API
+(`Database.StreamRecords`), so results are directly comparable with Zealot.
+
+**How it works**
+
+- *Cross-language database access.* `dbbridge/` is a small Go package built as a
+  cgo `c-archive` and linked into the C++ binaries. It imports shuffle's generated
+  stubs (`proto_gen`) and record format (`utility`) straight from the shuffle
+  checkout, so the API cannot drift. Clients verify each record with shuffle's
+  own `utility.GenerateRecord`, through the same bridge.
+- *Records → plaintexts.* With `B = RecordBytes`, each plaintext holds
+  `floor(3072 / B)` whole records (3072 B = 12 bits × 2048 coefficients), so one
+  query retrieves one record. `B ≤ 3072` is required.
+- *One round.* Clients upload keys (offline), then queries. The server
+  preprocesses each query as it arrives (expansion, RGSW selectors, first-dim
+  query in NTT form). Once all C are in, it streams records `[0, N)` once, in
+  chunks of `--chunk-rows` first-dimension rows, downloading the next chunk while
+  it computes on the current one. Per chunk, it NTT-encodes the plaintexts, runs
+  one batched first-dimension product against all C queries (each DB tile stays
+  in cache across clients), and folds the rows into each client's selection tree.
+  The server never stores the database. Per client it keeps O(log rows)
+  ciphertexts plus the expanded query, about 26 MB at the default chunk size. The
+  server prints the estimate and warns if C would exceed RAM.
+- Only the composite config (`k1_comp`, the default) is supported by the
+  streaming server.
+
+**Prerequisites:** everything above, plus Go 1.25+ and a shuffle checkout next to
+this repo (`../shuffle`, with `python3 proto.py` run once; override with
+`-DSHUFFLE_DIR=...`). Without them, CMake skips these two targets.
+
+**Local run** (database, server, and clients as separate processes on 127.0.0.1):
+
+```bash
+export HEXL_DIR=~/hexl_install/lib/cmake/hexl-1.2.6     # where HEXLConfig.cmake lives
+python3 scripts/local_test.py                           # tiny smoke test
+python3 scripts/local_test.py --config ../shuffle/testFiles/fromPaper/row1.json --N 100000 --C 16
+```
+
+**AWS run** (SSM, same conventions as shuffle's `cmd/zealot_remote_test.py`):
+
+```bash
+python3 scripts/remote_test.py --aws-config ../shuffle/awsConfigs/c8i16xlarge.json \
+    --config ../shuffle/testFiles/fromPaper/row1.json --C 100 --output outputs/row1_c100.txt
+```
+
+Experiments are specified exactly as for Zealot: an AWS config plus a shuffle
+experiment config, with `--N`, `--C`, `--B` (RecordBytes) overrides. In the AWS
+config, `serverInstance` runs the database and `onionServerInstance` runs the
+OnionPIR server (default: the last `proxyInstances` entry, Zealot's database
+streamer). `clientInstance` runs the clients (default: the server host). See
+`awsConfigs/example.json` for the optional `onion*` knobs. The driver builds HEXL
+on first use (`scripts/ec2_setup.sh`, into `/opt/hexl`) and builds out of tree in
+`/tmp/onionpir-build`. It expects both repos to be cloned on the server and
+client hosts at `--remote-repo` / `--remote-shuffle` (defaults
+`/home/ec2-user/OnionPIR-Extended`, `/home/ec2-user/shuffle`). The OnionPIR server
+listens on the port of the config's last `ProxyAddresses` entry; the database
+listens on `ServerAddr`'s port.
+
+**Output.** The client prints Zealot's `=== Performance Metrics ===` block with
+the same labels, so the two systems can be compared line for line.
+`Query-to-result latency (avg)` (also printed as `Average end-to-end latency`)
+runs from the start of a client's query generation to its decrypted, verified
+record. Offline key setup (Galois keys + GSW(sk), about 2.9 MB per client) has
+no Zealot counterpart and is reported separately. The server's timing
+breakdown and the database's own stream timing follow.
 
 ### Tips
 

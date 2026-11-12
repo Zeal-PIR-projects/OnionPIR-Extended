@@ -9,11 +9,13 @@ TimerLogger &TimerLogger::getInstance() {
 
 // Start logging time for a section
 void TimerLogger::start(const std::string &sectionName) {
+  if (!threadEnabled_) return;
   startTimes[sectionName] = std::chrono::high_resolution_clock::now();
 }
 
 // Stop logging time for a section
 void TimerLogger::end(const std::string &sectionName) {
+  if (!threadEnabled_) return;
   auto it = startTimes.find(sectionName);
   if (it != startTimes.end()) {
     double duration =
@@ -176,10 +178,12 @@ void TimerLogger::prettyPrint() {
 }
 
 void TimerLogger::startOnce(const std::string &sectionName) {
+  if (!threadEnabled_) return;
   onceStartTimes_[sectionName] = std::chrono::high_resolution_clock::now();
 }
 
 void TimerLogger::endOnce(const std::string &sectionName) {
+  if (!threadEnabled_) return;
   auto it = onceStartTimes_.find(sectionName);
   if (it != onceStartTimes_.end()) {
     onceTimes_[sectionName] = std::chrono::duration<double, std::milli>(

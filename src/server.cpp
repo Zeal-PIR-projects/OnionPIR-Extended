@@ -544,6 +544,12 @@ RlweCt PirServer::evaluate_other_dim(std::vector<RlweCt> &mid_db, std::vector<GS
 
 
 void PirServer::ext_prod_mux(RlweCt &x, RlweCt &y, GSWCt &selection_cipher, RlweCt &result) {
+  server_ops::ext_prod_mux(pir_params_, data_gsw_, x, y, selection_cipher, result);
+}
+
+void server_ops::ext_prod_mux(const PirParams &pir_params_, GSWEval &data_gsw_,
+                              RlweCt &x, RlweCt &y, GSWCt &selection_cipher,
+                              RlweCt &result) {
     constexpr size_t N = DBConsts::PolyDegree;
     const auto &qs = pir_params_.get_rns_mods();
     const size_t K = qs.size();
@@ -611,13 +617,21 @@ void PirServer::ext_prod_mux(RlweCt &x, RlweCt &y, GSWCt &selection_cipher, Rlwe
 //  single-loop level-order expansion  (root index = 1)
 std::vector<RlweCt>
 PirServer::fast_expand_qry(std::size_t client_id, RlweCt &ciphertext) const {
+  return server_ops::fast_expand_qry(pir_params_,
+                                     client_bv_galois_keys_.at(client_id),
+                                     ciphertext);
+}
+
+std::vector<RlweCt>
+server_ops::fast_expand_qry(const PirParams &pir_params_,
+                            const bvks::BvGaloisKeys &bv_galois_key,
+                            RlweCt &ciphertext) {
   // ============== parameters
   const size_t useful_cnt = pir_params_.get_fst_dim_sz() +
                             pir_params_.get_l() *
                                 (pir_params_.get_num_dims() - 1); // u
   const size_t expan_height = pir_params_.get_expan_height(); // h
   const size_t capacity = size_t{1} << expan_height;          // 2^h
-  const auto &bv_galois_key = client_bv_galois_keys_.at(client_id);
   constexpr size_t N = DBConsts::PolyDegree;
   const auto &qs = pir_params_.get_rns_mods();
   const size_t K = qs.size();
@@ -766,6 +780,12 @@ RlweCt PirServer::make_query(const size_t client_id, RlweCt &query) {
 
 size_t PirServer::save_resp_to_stream(const RlweCt &response,
                                       std::stringstream &stream) {
+  return server_ops::save_resp_to_stream(pir_params_, response, stream);
+}
+
+size_t server_ops::save_resp_to_stream(const PirParams &pir_params_,
+                                       const RlweCt &response,
+                                       std::ostream &stream) {
   // For now, we only serve the single modulus case.
 
   // --- 1.  Runtime parameters ------------------------------------------------
@@ -833,6 +853,11 @@ void PirServer::fill_inter_res() {
 }
 
 void PirServer::mod_switch_inplace(RlweCt &ciphertext, const uint64_t q) {
+  server_ops::mod_switch_inplace(pir_params_, ciphertext, q);
+}
+
+void server_ops::mod_switch_inplace(const PirParams &pir_params_,
+                                    RlweCt &ciphertext, const uint64_t q) {
   constexpr size_t coeff_count = DBConsts::PolyDegree;
   constexpr size_t K = DBConsts::RnsMods.size();
   const auto &qs = pir_params_.get_rns_mods();

@@ -313,9 +313,14 @@ void level_mat_mat_32(const uint32_t *A_data, const uint32_t *B_data,
                             level_qs.data());
   return;
 #else
-  // Scalar fallback. Per-output Barrett reduce; uint64 accumulator stays
-  // within bounds for the same reason as the AVX path (n · q² < 2^64).
+  // Scalar fallback (no AVX-512, e.g. ARM). Unlike the AVX path, which spreads
+  // the sum over 16 lanes (⌈n/16⌉ · q² < 2^64), a single uint64 accumulator
+  // overflows for n · q² ≥ 2^64 (n=512, q~2^29 → 2^67). Reduce every `chunk`
+  // terms so that (q-1) + chunk · (q-1)² < 2^64.
   const auto b64 = utils::barrett_u64_setup(q);
+  const uint64_t qm1 = q - 1;
+  const size_t chunk = static_cast<size_t>(
+      std::min<uint64_t>((UINT64_MAX - qm1) / (qm1 * qm1), n));
   for (size_t level = 0; level < levels; ++level) {
     const uint32_t *A_ptr = A_data + level * (m * n);
     const uint32_t *B_ptr = B_data + level * (n * 2);
@@ -323,10 +328,63 @@ void level_mat_mat_32(const uint32_t *A_data, const uint32_t *B_data,
     for (size_t i = 0; i < m; ++i) {
       const uint32_t *Ar = A_ptr + i * n;
       uint64_t t0 = 0, t1 = 0;
-      for (size_t k = 0; k < n; ++k) {
-        const uint64_t a = Ar[k];
-        t0 += a * static_cast<uint64_t>(B_ptr[2 * k]);
-        t1 += a * static_cast<uint64_t>(B_ptr[2 * k + 1]);
+      for (size_t k0 = 0; k0 < n; k0 += chunk) {
+        const size_t k_end = std::min(k0 + chunk, n);
+        for (size_t k = k0; k < k_end; ++k) {
+          const uint64_t a = Ar[k];
+          t0 += a * static_cast<uint64_t>(B_ptr[2 * k]);
+          t1 += a * static_cast<uint64_t>(B_ptr[2 * k + 1]);
+        }
+        if (k_end < n) {
+          t0 = utils::barrett_reduce_u64(t0, b64);
+          t1 = utils::barrett_reduce_u64(t1, b64);
+        }
+      }
+      C_ptr[2 * i]     = utils::barrett_reduce_u64(t0, b64);
+      C_ptr[2 * i + 1] = utils::barrett_reduce_u64(t1, b64);
+    }
+  }
+#endif
+}
+
+
+void level_mat_mat_32_split(const uint32_t *A_data, const uint32_t *B_data,
+                            uint64_t *out_data, size_t m, size_t n,
+                            size_t levels, uint64_t q) {
+#if defined(__AVX512F__)
+  // Bound: see level_mat_mat_32 (⌈n/16⌉ per-lane products, q < 2^30, n ≤ 1024).
+  const auto b128 = utils::barrett_u128_setup(q);
+  for (size_t level = 0; level < levels; ++level) {
+    const uint32_t *B0 = B_data + level * (2 * n);
+    mat_mat_avx512_safe(A_data + level * (m * n), B0, B0 + n,
+                        out_data + level * (m * 2), m, n, b128);
+  }
+#else
+  // Scalar fallback with the same overflow-safe chunked reduction as
+  // level_mat_mat_32: (q-1) + chunk·(q-1)² < 2^64.
+  const auto b64 = utils::barrett_u64_setup(q);
+  const uint64_t qm1 = q - 1;
+  const size_t chunk = static_cast<size_t>(
+      std::min<uint64_t>((UINT64_MAX - qm1) / (qm1 * qm1), n));
+  for (size_t level = 0; level < levels; ++level) {
+    const uint32_t *A_ptr = A_data + level * (m * n);
+    const uint32_t *B0 = B_data + level * (2 * n);
+    const uint32_t *B1 = B0 + n;
+    uint64_t *C_ptr = out_data + level * (m * 2);
+    for (size_t i = 0; i < m; ++i) {
+      const uint32_t *Ar = A_ptr + i * n;
+      uint64_t t0 = 0, t1 = 0;
+      for (size_t k0 = 0; k0 < n; k0 += chunk) {
+        const size_t k_end = std::min(k0 + chunk, n);
+        for (size_t k = k0; k < k_end; ++k) {
+          const uint64_t a = Ar[k];
+          t0 += a * static_cast<uint64_t>(B0[k]);
+          t1 += a * static_cast<uint64_t>(B1[k]);
+        }
+        if (k_end < n) {
+          t0 = utils::barrett_reduce_u64(t0, b64);
+          t1 = utils::barrett_reduce_u64(t1, b64);
+        }
       }
       C_ptr[2 * i]     = utils::barrett_reduce_u64(t0, b64);
       C_ptr[2 * i + 1] = utils::barrett_reduce_u64(t1, b64);

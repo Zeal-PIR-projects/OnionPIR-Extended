@@ -29,8 +29,13 @@ if (USE_HEXL)
     message(STATUS "HEXL support enabled.")
     add_compile_definitions(ONIONPIR_USE_HEXL)
     
-    # Set HEXL installation path
-    set(HEXL_DIR "/u/yuec12/OnionPIRv2/hexl_install/lib64/cmake/hexl-1.2.6")
+    # Set HEXL installation path (override with -DHEXL_DIR=... or the HEXL_DIR env var)
+    if (NOT HEXL_DIR AND DEFINED ENV{HEXL_DIR})
+        set(HEXL_DIR "$ENV{HEXL_DIR}")
+    endif()
+    if (NOT HEXL_DIR)
+        set(HEXL_DIR "/u/yuec12/OnionPIRv2/hexl_install/lib64/cmake/hexl-1.2.6")
+    endif()
     
     # Find HEXL package
     find_package(HEXL REQUIRED)
@@ -73,14 +78,82 @@ if (DEFINED ACTIVE_CONFIG)
 endif()
 
 
-# Automatically find all source files in src/
-file(GLOB_RECURSE SRC_FILES src/*.cpp)
-add_executable(Onion-PIR ${SRC_FILES})
+find_package(Threads REQUIRED)
 
-# Link HEXL if enabled
+# ---- Core library: everything directly in src/ except the test driver.
+file(GLOB CORE_SRC ${CMAKE_SOURCE_DIR}/src/*.cpp)
+list(REMOVE_ITEM CORE_SRC ${CMAKE_SOURCE_DIR}/src/main.cpp)
+add_library(onionpir_core STATIC ${CORE_SRC})
+target_include_directories(onionpir_core PUBLIC src/includes)
+target_link_libraries(onionpir_core PUBLIC Threads::Threads)
 if (USE_HEXL AND HEXL_FOUND)
-    target_link_libraries(Onion-PIR PUBLIC HEXL::hexl)
+    target_link_libraries(onionpir_core PUBLIC HEXL::hexl)
 endif()
 
-# Include directories
-target_include_directories(Onion-PIR PUBLIC src/includes)
+# ---- Single-query benchmark / test driver (python3 run.py -t ...).
+file(GLOB TEST_SRC ${CMAKE_SOURCE_DIR}/src/tests/*.cpp)
+add_executable(Onion-PIR src/main.cpp ${TEST_SRC})
+target_link_libraries(Onion-PIR PRIVATE onionpir_core)
+
+# ---- Multi-client server/client over a streamed, uncooperative database.
+# The database is the Zealot/shuffle Go service; dbbridge/ is a cgo c-archive
+# that speaks its gRPC API using shuffle's own generated stubs.
+option(BUILD_STREAMING "Build onion_server/onion_client (needs Go and a shuffle checkout)" ON)
+set(SHUFFLE_DIR "${CMAKE_SOURCE_DIR}/../shuffle" CACHE PATH
+    "Zealot/shuffle checkout that provides the database API (proto_gen)")
+if (BUILD_STREAMING)
+    find_program(GO_EXECUTABLE go HINTS /usr/local/go/bin $ENV{HOME}/go/bin)
+    get_filename_component(SHUFFLE_DIR_ABS "${SHUFFLE_DIR}" ABSOLUTE)
+    if (NOT GO_EXECUTABLE)
+        message(WARNING "Go not found: skipping onion_server/onion_client (install Go 1.25+).")
+        set(BUILD_STREAMING OFF)
+    elseif (NOT EXISTS "${SHUFFLE_DIR_ABS}/proto_gen/pir_grpc.pb.go")
+        message(WARNING "${SHUFFLE_DIR_ABS}/proto_gen not found: skipping onion_server/onion_client. "
+                        "Run `python3 proto.py` in the shuffle checkout, or set -DSHUFFLE_DIR=...")
+        set(BUILD_STREAMING OFF)
+    endif()
+endif()
+if (BUILD_STREAMING)
+    message(STATUS "Database API from shuffle checkout: ${SHUFFLE_DIR_ABS}")
+    if (NOT "${ACTIVE_CONFIG}" STREQUAL "CONFIG_N2048_K1_COMP")
+        message(STATUS "Note: onion_server supports only ACTIVE_CONFIG=CONFIG_N2048_K1_COMP (it exits otherwise).")
+    endif()
+
+    # Build-dir copy of go.mod whose replace directive points at SHUFFLE_DIR,
+    # so the source tree is never edited.
+    set(BRIDGE_DIR ${CMAKE_BINARY_DIR}/dbbridge)
+    file(MAKE_DIRECTORY ${BRIDGE_DIR})
+    file(READ ${CMAKE_SOURCE_DIR}/dbbridge/go.mod BRIDGE_GOMOD)
+    string(REPLACE "=> ../../shuffle" "=> ${SHUFFLE_DIR_ABS}" BRIDGE_GOMOD "${BRIDGE_GOMOD}")
+    file(WRITE ${BRIDGE_DIR}/go.mod.in "${BRIDGE_GOMOD}")
+    configure_file(${BRIDGE_DIR}/go.mod.in ${BRIDGE_DIR}/go.mod COPYONLY)
+    configure_file(${CMAKE_SOURCE_DIR}/dbbridge/go.sum ${BRIDGE_DIR}/go.sum COPYONLY)
+
+    # Always invoke go build; Go's own cache makes it a no-op when nothing
+    # (here or in the shuffle checkout) changed.
+    add_custom_target(dbbridge
+        COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1
+                ${GO_EXECUTABLE} build -buildvcs=false -modfile=${BRIDGE_DIR}/go.mod
+                -buildmode=c-archive -o ${BRIDGE_DIR}/libdbbridge.a .
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/dbbridge
+        BYPRODUCTS ${BRIDGE_DIR}/libdbbridge.a ${BRIDGE_DIR}/libdbbridge.h
+        COMMENT "Building Go database bridge (cgo c-archive)")
+
+    file(GLOB STREAM_SRC ${CMAKE_SOURCE_DIR}/src/stream/*.cpp)
+    add_library(onionpir_stream STATIC ${STREAM_SRC})
+    add_dependencies(onionpir_stream dbbridge)
+    target_include_directories(onionpir_stream PUBLIC src/stream ${BRIDGE_DIR})
+    target_link_libraries(onionpir_stream PUBLIC onionpir_core ${BRIDGE_DIR}/libdbbridge.a)
+    # System libraries the Go runtime (net, crypto/x509) needs in a c-archive.
+    if (APPLE)
+        target_link_libraries(onionpir_stream PUBLIC resolv
+            "-framework CoreFoundation" "-framework Security")
+    else()
+        target_link_libraries(onionpir_stream PUBLIC resolv ${CMAKE_DL_LIBS})
+    endif()
+
+    add_executable(onion_server src/apps/onion_server.cpp)
+    target_link_libraries(onion_server PRIVATE onionpir_stream)
+    add_executable(onion_client src/apps/onion_client.cpp)
+    target_link_libraries(onion_client PRIVATE onionpir_stream)
+endif()

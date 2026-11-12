@@ -150,6 +150,8 @@ private:
   // Stores timing data for the current experiment
   std::unordered_map<std::string, double> currentExperiment;
 
+  static inline thread_local bool threadEnabled_ = true;
+
   // Private constructor for Singleton
   TimerLogger() = default;
 
@@ -194,6 +196,10 @@ public:
   void cleanup();
 
   static void setWarmup(std::size_t n) { WARMUP_ITERATIONS = n; }
+
+  // The logger is a non-thread-safe singleton. Worker threads (the streaming
+  // server's pool) disable it for themselves; timers on other threads still run.
+  static void setThreadEnabled(bool enabled) { threadEnabled_ = enabled; }
 
   // Prevent copying
   TimerLogger(const TimerLogger &) = delete;

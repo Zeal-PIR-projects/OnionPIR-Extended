@@ -1,0 +1,12 @@
+{
+    "_comment": "Same format as shuffle/awsConfigs/*.json, which scripts/remote_test.py also accepts unchanged. serverInstance runs the uncooperative database; onionServerInstance runs the OnionPIR server (default: last proxyInstances entry); clientInstance runs the C simulated clients (default: the OnionPIR server host). The onion* knobs are optional.",
+    "serverInstance": "i-REPLACE_DATABASE",
+    "onionServerInstance": "i-REPLACE_ONION_SERVER",
+    "clientInstance": "i-REPLACE_CLIENT",
+    "region": "us-west-1",
+    "onionThreads": 0,
+    "onionChunkRows": 64,
+    "onionDbBatch": 4096,
+    "onionConnections": 16,
+    "hexlPrefix": "/opt/hexl"
+}

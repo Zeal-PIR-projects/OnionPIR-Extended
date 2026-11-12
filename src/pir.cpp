@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 void PirParams::init_composite_rns() {
@@ -40,6 +41,17 @@ void PirParams::init_composite_rns() {
 
 PirParams::PirParams()
     : rns_mod_bits_(DBConsts::RnsMods.begin(), DBConsts::RnsMods.end()) {
+  init(DBConsts::DB_SIZE_MB * 1024 * 1024 / get_pt_size(), false);
+}
+
+PirParams::PirParams(size_t target_num_pt, bool pow2_other_dim)
+    : rns_mod_bits_(DBConsts::RnsMods.begin(), DBConsts::RnsMods.end()) {
+  if (target_num_pt == 0)
+    throw std::invalid_argument("PirParams: target_num_pt must be > 0");
+  init(target_num_pt, pow2_other_dim);
+}
+
+void PirParams::init(size_t target_num_pt, bool pow2_other_dim) {
   if constexpr (DBConsts::CompositeFirstDim) {
     init_composite_rns();
   } else {
@@ -75,7 +87,6 @@ PirParams::PirParams()
   base_log2_key_ = (ct_mod_width + l_key_ - 1) / l_key_;
 
   // =============== Database shape calculation ===============
-  size_t target_num_pt = DBConsts::DB_SIZE_MB * 1024 * 1024 / get_pt_size();
   DEBUG_PRINT("target_num_pt: " << target_num_pt);
   // Per-dim query slot count is l_ep_ (one BFV per gadget power).
   auto [fst_dim_sz, num_dims] = utils::calculate_db_shape(
@@ -84,6 +95,7 @@ PirParams::PirParams()
   num_dims_ = num_dims;
   DEBUG_PRINT("fst_dim_sz: " << fst_dim_sz_ << ", num_dims: " << num_dims_);
   size_t other_dim_sz = utils::roundup_div(target_num_pt, fst_dim_sz_);
+  if (pow2_other_dim) other_dim_sz = size_t{1} << (num_dims_ - 1);
   num_pt_ = fst_dim_sz_ * other_dim_sz;
 }
 

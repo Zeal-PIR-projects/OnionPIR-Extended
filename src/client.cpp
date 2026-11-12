@@ -344,8 +344,11 @@ RlwePt PirClient::decrypt_mod_q(const RlweCt &ct) const {
   int budget = (max_noise > 0)
     ? static_cast<int>(std::log2(static_cast<double>(q) / (2.0 * t * max_noise)))
     : static_cast<int>(std::log2(static_cast<double>(q) / (2.0 * t)));
-  BENCH_PRINT("Noise budget after decryption: " << budget
-              << " (max noise: " << max_noise << ")");
+  last_noise_budget_ = budget;
+  if (print_noise_budget) {
+    BENCH_PRINT("Noise budget after decryption: " << budget
+                << " (max noise: " << max_noise << ")");
+  }
 
   return result;
 }

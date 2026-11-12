@@ -28,7 +28,13 @@ struct CompositeRnsTables {
 // ================== CLASS DEFINITIONS ==================
 class PirParams {
 public:
+  // Database sized by DBConsts::DB_SIZE_MB (benchmark/test default).
   PirParams();
+  // Database sized at runtime to hold at least `target_num_pt` plaintexts.
+  // pow2_other_dim rounds the other-dimension size up to 2^(num_dims-1) so
+  // the selection tree is perfect (used by the streaming server, which skips
+  // the all-zero padding rows). Same fst_dim_sz / num_dims either way.
+  explicit PirParams(size_t target_num_pt, bool pow2_other_dim = false);
   PirParams(const PirParams &pir_params) = default;
 
   // ================== getters ==================
@@ -115,4 +121,5 @@ private:
   // Registers the CRT-combined 2N-th root with utils so later NTT calls on the
   // composite modulus pick it up (HEXL's default ctor assumes a prime).
   void init_composite_rns();
+  void init(size_t target_num_pt, bool pow2_other_dim);
 };

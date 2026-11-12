@@ -31,7 +31,7 @@ intel::hexl::NTT &get_ntt(size_t N, uint64_t q) {
       return std::hash<size_t>()(k.N) ^ (std::hash<uint64_t>()(k.q) * 0x9E3779B97F4A7C15ULL);
     }
   };
-  static std::unordered_map<Key, std::unique_ptr<intel::hexl::NTT>, Hash> cache;
+  thread_local std::unordered_map<Key, std::unique_ptr<intel::hexl::NTT>, Hash> cache;
   auto it = cache.find({N, q});
   if (it != cache.end()) return *it->second;
   auto ntt = (N == g_custom_N && q == g_custom_q)

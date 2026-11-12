@@ -283,7 +283,7 @@ struct GaloisScratch {
   std::vector<uint64_t> c0_perm, c1_perm, delta_a, delta_b, tmp;
   std::vector<uint64_t> digits;  // L_KS contiguous N-blocks (row-major)
 };
-static GaloisScratch g_scratch;
+thread_local GaloisScratch g_scratch;  // per-thread: expansion runs on many server threads
 }  // namespace
 
 // K=1: signed gadget decomposition (existing path, tighter noise).
