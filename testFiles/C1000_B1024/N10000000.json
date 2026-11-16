@@ -1,0 +1,19 @@
+{
+  "_comment": "OnionPIR sweep: C=1000 (split across the 3 servers), 1 KiB records, N=10000000 (DB 9.54 GiB). Hosts come from the AWS config.",
+  "N": 10000000,
+  "Num_cols": 32,
+  "Num_rows": 312504,
+  "RecordBytes": 1024,
+  "Modulus": 2147483647,
+  "W": 100,
+  "Z": 1,
+  "C": 1000,
+  "L": 8,
+  "ServerAddr": "PLACEHOLDER:10000",
+  "ClientAddr": "PLACEHOLDER:10001",
+  "ProxyAddresses": [
+    "PLACEHOLDER:10002",
+    "PLACEHOLDER:10003",
+    "PLACEHOLDER:10004"
+  ]
+}

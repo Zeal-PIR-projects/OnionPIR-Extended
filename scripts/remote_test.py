@@ -26,6 +26,7 @@ Optional deployment knobs (AWS config, like zealotXORWorkers):
 """
 import argparse
 import base64
+import gzip
 import json
 import os
 import shlex
@@ -45,6 +46,7 @@ import experiment as ex  # noqa: E402
 REMOTE_CONFIG = "/tmp/onionpir_config.json"
 PREFIX = "/tmp/onionpir"  # binaries /tmp/onionpir_{db,server,client}, logs *.log
 REMOTE_BUILD = "/tmp/onionpir-build"
+SSM_CHUNK = 20000  # SSM returns at most 24000 characters of stdout per command
 # SSM starts a non-login root shell; share the Go caches the Zealot driver uses.
 GO_ENV = ("export PATH=/usr/local/go/bin:$PATH:$HOME/go/bin && "
           "export GOPATH=/tmp/gopath && export GOMODCACHE=/tmp/gomodcache && "
@@ -84,11 +86,39 @@ def run_parallel(jobs):
     """jobs: {label: callable}; returns {label: result}."""
     results = {}
     def run(label, fn):
-        results[label] = fn()
+        try:
+            results[label] = fn()
+        except Exception as exc:  # re-raised below with its label
+            results[label] = exc
     threads = [threading.Thread(target=run, args=item) for item in jobs.items()]
     for thread in threads: thread.start()
     for thread in threads: thread.join()
+    for label, result in results.items():
+        if isinstance(result, Exception):
+            raise RuntimeError(f"{label}: {result}")
     return results
+
+
+def fetch_file(ssm, instance_id, path):
+    """The whole remote file (SSM truncates stdout, so it comes gzip+base64
+    encoded in chunks); "" if it does not exist."""
+    q = shlex.quote
+    encoded = f"/tmp/onionpir_fetch.{abs(hash(path))}.b64"
+    _, out, _ = ssm_run(ssm, instance_id, [
+        f"if [ -f {q(path)} ]; then gzip -c {q(path)} | base64 -w0 > {encoded} && "
+        f"stat -c %s {encoded}; else echo MISSING; fi"], comment="onionpir-fetch")
+    out = out.strip()
+    if not out or out == "MISSING":
+        return ""
+    size, parts = int(out), []
+    for start in range(0, size, SSM_CHUNK):
+        status, chunk, err = ssm_run(ssm, instance_id, [
+            f"tail -c +{start + 1} {encoded} | head -c {SSM_CHUNK}"], comment="onionpir-fetch")
+        if status != "Success":
+            raise RuntimeError(f"fetching {path} from {instance_id}: {status} {err}")
+        parts.append(chunk.strip())
+    ssm_run(ssm, instance_id, [f"rm -f {encoded}"], comment="onionpir-fetch")
+    return gzip.decompress(base64.b64decode("".join(parts))).decode(errors="replace")
 
 
 def private_ip(ec2, instance_id):
@@ -183,6 +213,9 @@ def main():
     ap.add_argument("--git-pull", action="store_true", help="git pull --ff-only both checkouts first")
     ap.add_argument("--demo-index", type=int, help="client 0 queries this index and prints its record")
     ap.add_argument("--output", help="also write the report to this file")
+    ap.add_argument("--no-build", action="store_true",
+                    help="reuse the binaries already in /tmp (skip proto regeneration and builds)")
+    ap.add_argument("--log-dir", help="save every host's full log, the experiment config and the hosts here")
     args = ap.parse_args()
 
     with open(ex.resolve(args.aws_config, os.getcwd())) as file:
@@ -240,7 +273,8 @@ def main():
                     require(f"git pull {label} {repo}", ssm_run(ssm, iid, [as_ec2_user(
                         f"cd {q(repo)} && git pull --ff-only")], comment="onionpir-pull"))
 
-        build_all(ssm, hosts, args.remote_repo, args.remote_shuffle, hexl_prefix)
+        if not args.no_build:
+            build_all(ssm, hosts, args.remote_repo, args.remote_shuffle, hexl_prefix)
 
         print("==> Starting database...")
         require("start database", ssm_run(ssm, db_id, [
@@ -286,9 +320,23 @@ def main():
         time.sleep(1)  # server prints its report after the last reply
         sources = [("client", client_id, "client"), ("database", db_id, "db")] + \
             [(f"server{i}", iid, "server") for i, iid in enumerate(onion_ids)]
-        logs = run_parallel({label: (lambda iid=iid, name=name: ssm_run(
-            ssm, iid, [f"cat {PREFIX}_{name}.log 2>/dev/null || true"],
-            comment=f"onionpir-log-{name}")[1]) for label, iid, name in sources})
+        logs = run_parallel({label: (lambda iid=iid, name=name: fetch_file(
+            ssm, iid, f"{PREFIX}_{name}.log")) for label, iid, name in sources})
+        if args.log_dir:
+            os.makedirs(args.log_dir, exist_ok=True)
+            for label, text in logs.items():
+                with open(os.path.join(args.log_dir, f"{label}.log"), "w") as file:
+                    file.write(text)
+            with open(os.path.join(args.log_dir, "config.json"), "w") as file:
+                json.dump(dict(config, ServerAddr=db_addr, OnionServers=onion_addrs, Knobs=knobs),
+                          file, indent=2)
+            described = ec2.describe_instances(InstanceIds=sorted(set(hosts.values())))
+            info = {i["InstanceId"]: {"type": i["InstanceType"], "private_ip": i.get("PrivateIpAddress"),
+                                      "zone": i["Placement"]["AvailabilityZone"]}
+                    for r in described["Reservations"] for i in r["Instances"]}
+            with open(os.path.join(args.log_dir, "hosts.json"), "w") as file:
+                json.dump({label: dict(info[iid], instance=iid) for label, iid in
+                           dict(hosts, client=client_id).items()}, file, indent=2)
         client_ok = status == "Success" and "EXIT:0" in stdout
 
         out("\n================ TEST RESULT ================")
