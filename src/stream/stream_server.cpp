@@ -58,7 +58,9 @@ StreamPirServer::StreamPirServer(const PirParams &params,
     throw std::runtime_error("database does not fit the PIR shape");
   if (opts_.num_clients == 0) throw std::invalid_argument("C must be positive");
 
-  chunk_rows_ = std::min(floor_pow2(std::max<size_t>(1, opts_.chunk_rows)),
+  // --chunk-rows budgets plaintexts per chunk; k planes share it.
+  k_ = layout_.pts_per_record;
+  chunk_rows_ = std::min(floor_pow2(std::max<size_t>(1, opts_.chunk_rows / k_)),
                          size_t{1} << h_);
   chunk_bits_ = static_cast<size_t>(std::countr_zero(chunk_rows_));
   q_ = params_.get_rns_mods()[0];
@@ -74,8 +76,8 @@ StreamPirServer::StreamPirServer(const PirParams &params,
     data_gsw_.push_back(std::make_unique<GSWEval>(
         params_, params_.get_l(), params_.get_base_log2()));
   }
-  a_lo_ = make_unique_aligned<uint32_t, 64>(chunk_rows_ * n_ * levels_);
-  a_hi_ = make_unique_aligned<uint32_t, 64>(chunk_rows_ * n_ * levels_);
+  a_lo_ = make_unique_aligned<uint32_t, 64>(k_ * chunk_rows_ * n_ * levels_);
+  a_hi_ = make_unique_aligned<uint32_t, 64>(k_ * chunk_rows_ * n_ * levels_);
 }
 
 StreamPirServer::~StreamPirServer() = default;
@@ -84,8 +86,8 @@ size_t StreamPirServer::bytes_per_client() const {
   const size_t ct = 2 * levels_ * sizeof(uint64_t);
   const size_t query = 2 * levels_ * 2 * n_ * sizeof(uint32_t);
   const size_t selectors = h_ * 2 * params_.get_l() * ct;
-  const size_t inter = 2 * chunk_rows_ * 2 * levels_ * sizeof(uint64_t);
-  const size_t tree = (chunk_rows_ + h_ + 1) * ct;
+  const size_t inter = 2 * k_ * chunk_rows_ * 2 * levels_ * sizeof(uint64_t);
+  const size_t tree = k_ * (chunk_rows_ + h_ + 1) * ct;
   return query + selectors + inter + tree;
 }
 
@@ -190,10 +192,10 @@ void StreamPirServer::preprocess(uint32_t client_id, RlweCt &query) {
   // Key material is no longer needed; release it before the round.
   bvks::BvGaloisKeys().keys.swap(cl.galois_keys.keys);
   GSWCt().swap(cl.gsw_key);
-  cl.inter_lo.assign(chunk_rows_ * 2 * levels_, 0);
-  cl.inter_hi.assign(chunk_rows_ * 2 * levels_, 0);
-  cl.leaves.assign(chunk_rows_, Node{});
-  cl.stack.assign(h_ + 1, Node{});
+  cl.inter_lo.assign(k_ * chunk_rows_ * 2 * levels_, 0);
+  cl.inter_hi.assign(k_ * chunk_rows_ * 2 * levels_, 0);
+  cl.leaves.assign(k_ * chunk_rows_, Node{});
+  cl.stacks.assign(k_, std::vector<Node>(h_ + 1));
 }
 
 GSWCt &StreamPirServer::selector_for_bit(Client &cl, size_t bit) {
@@ -214,48 +216,49 @@ void StreamPirServer::mux_into(Client &cl, Node &x, Node &y, size_t bit,
   y = Node{};
 }
 
-void StreamPirServer::push_subtree(Client &cl, Node node, size_t level,
-                                   size_t tid) {
+void StreamPirServer::push_subtree(Client &cl, std::vector<Node> &stack,
+                                   Node node, size_t level, size_t tid) {
   // Binary-counter merge: a pending left sibling at `level` combines with
   // `node`, resolving row bit `level`.
-  while (level < h_ && cl.stack[level].present) {
-    Node &left = cl.stack[level];
+  while (level < h_ && stack[level].present) {
+    Node &left = stack[level];
     mux_into(cl, left, node, level, tid);
     node = std::move(left);
     left = Node{};
     ++level;
   }
   node.present = true;
-  cl.stack[level] = std::move(node);
+  stack[level] = std::move(node);
 }
 
 void StreamPirServer::encode_chunk(const uint8_t *raw, size_t first_pt,
                                    size_t rows) {
   constexpr size_t N = DBConsts::PolyDegree;
   constexpr size_t kTile = 16;  // plaintexts per task; writes stay contiguous
-  const size_t pts = rows * n_;
+  const size_t pts = rows * n_;    // per plane
+  const size_t total = k_ * pts;   // all planes, plane-major
   const size_t pt_stride = layout_.records_per_pt * layout_.record_bytes;
   uint32_t *a_lo = a_lo_.get(), *a_hi = a_hi_.get();
-  pool_.parallel_for((pts + kTile - 1) / kTile, [&](size_t t) {
+  pool_.parallel_for((total + kTile - 1) / kTile, [&](size_t t) {
     thread_local std::vector<uint64_t> tile;
     tile.resize(kTile * N);
     const size_t p0 = t * kTile;
-    const size_t cnt = std::min(kTile, pts - p0);
+    const size_t cnt = std::min(kTile, total - p0);
     for (size_t p = 0; p < cnt; ++p) {
-      const size_t lp = p0 + p;
-      const size_t records = layout_.records_in_pt(first_pt + lp);
+      const size_t plane = (p0 + p) / pts, lp = (p0 + p) % pts;
+      const size_t bytes = layout_.segment_bytes(first_pt + lp, plane);
       uint64_t *c = tile.data() + p * N;
-      if (records == 0) {
+      if (bytes == 0) {
         std::fill(c, c + N, 0);  // padding plaintext (last row)
         continue;
       }
-      bytes_to_coeffs(raw + lp * pt_stride, records * layout_.record_bytes, c);
+      bytes_to_coeffs(raw + lp * pt_stride + plane * plaintext_bytes(), bytes, c);
       utils::ntt_fwd(c, N, q_);
     }
-    // A layout: [level][row][col] = level * pts + local plaintext index.
+    // A layout: [level][plane * rows + row][col] = level * total + p0 + p.
     for (size_t lvl = 0; lvl < levels_; ++lvl) {
-      uint32_t *dlo = a_lo + lvl * pts + p0;
-      uint32_t *dhi = a_hi + lvl * pts + p0;
+      uint32_t *dlo = a_lo + lvl * total + p0;
+      uint32_t *dhi = a_hi + lvl * total + p0;
       for (size_t p = 0; p < cnt; ++p) {
         const uint64_t v = tile[p * N + lvl];
         dlo[p] = static_cast<uint32_t>(v % q1_);
@@ -269,22 +272,23 @@ void StreamPirServer::process_chunk(size_t rows) {
   const size_t C = clients_.size();
 
   // ---- Batched first-dim product: task = (limb, level block). Each task's
-  // DB tile (lb levels x rows x n, ~1 MiB) stays in cache while every
+  // DB tile (lb levels x k*rows x n, ~1 MiB) stays in cache while every
   // client's query block streams past it.
   auto t0 = Clock::now();
-  const size_t tile_bytes = rows * n_ * sizeof(uint32_t);
+  const size_t m = k_ * rows;  // planes stacked as extra rows
+  const size_t tile_bytes = m * n_ * sizeof(uint32_t);
   const size_t lb = std::clamp<size_t>((size_t{1} << 20) / tile_bytes, 1, levels_);
   const size_t blocks = (levels_ + lb - 1) / lb;
   pool_.parallel_for(2 * blocks, [&](size_t t) {
     const bool hi = t >= blocks;
     const size_t l0 = (t % blocks) * lb;
     const size_t lc = std::min(lb, levels_ - l0);
-    const uint32_t *A = (hi ? a_hi_.get() : a_lo_.get()) + l0 * rows * n_;
+    const uint32_t *A = (hi ? a_hi_.get() : a_lo_.get()) + l0 * m * n_;
     const uint64_t q = hi ? q2_ : q1_;
     for (auto &cl : clients_) {
       const uint32_t *B = (hi ? cl->q_hi.get() : cl->q_lo.get()) + l0 * 2 * n_;
-      uint64_t *out = (hi ? cl->inter_hi.data() : cl->inter_lo.data()) + l0 * rows * 2;
-      level_mat_mat_32_split(A, B, out, rows, n_, lc, q);
+      uint64_t *out = (hi ? cl->inter_hi.data() : cl->inter_lo.data()) + l0 * m * 2;
+      level_mat_mat_32_split(A, B, out, m, n_, lc, q);
     }
   });
   report_.matmul_ms += ms_since(t0);
@@ -296,10 +300,12 @@ void StreamPirServer::process_chunk(size_t rows) {
     const uint64_t diff = (hi + q2 - lo % q2) % q2;
     return lo + q1 * ((diff * q1_inv) % q2);
   };
-  pool_.parallel_for(C * chunk_rows_, [&](size_t t) {
-    Client &cl = *clients_[t / chunk_rows_];
+  const size_t per_client = k_ * chunk_rows_;
+  pool_.parallel_for(C * per_client, [&](size_t t) {
+    Client &cl = *clients_[t / per_client];
+    const size_t plane = (t % per_client) / chunk_rows_;
     const size_t i = t % chunk_rows_;
-    Node &leaf = cl.leaves[i];
+    Node &leaf = cl.leaves[t % per_client];
     leaf = Node{};
     leaf.present = true;
     if (i >= rows) return;  // past the last real row: zero leaf
@@ -307,7 +313,7 @@ void StreamPirServer::process_chunk(size_t rows) {
     ct.c0.resize(levels_);
     ct.c1.resize(levels_);
     for (size_t lvl = 0; lvl < levels_; ++lvl) {
-      const size_t b = lvl * rows * 2 + 2 * i;
+      const size_t b = lvl * m * 2 + 2 * (plane * rows + i);
       ct.c0[lvl] = compose(cl.inter_lo[b], cl.inter_hi[b]);
       ct.c1[lvl] = compose(cl.inter_lo[b + 1], cl.inter_hi[b + 1]);
     }
@@ -319,21 +325,25 @@ void StreamPirServer::process_chunk(size_t rows) {
   });
   report_.leaves_ms += ms_since(t0);
 
-  // ---- Reduce the chunk's leaves to one subtree (row bits
-  // 0..chunk_bits-1), parallel over (client, pair) per level, then push it.
+  // ---- Reduce each plane's leaves to one subtree (row bits
+  // 0..chunk_bits-1), parallel over (client, plane, pair) per level, then
+  // push it onto that plane's tree.
   t0 = Clock::now();
   for (size_t s = 0; s < chunk_bits_; ++s) {
     const size_t pairs = chunk_rows_ >> (s + 1);
-    pool_.parallel_for(C * pairs, [&](size_t t) {
-      Client &cl = *clients_[t / pairs];
-      const size_t left = (t % pairs) << (s + 1);
+    pool_.parallel_for(C * k_ * pairs, [&](size_t t) {
+      Client &cl = *clients_[t / (k_ * pairs)];
+      const size_t plane = (t / pairs) % k_;
+      const size_t left = plane * chunk_rows_ + ((t % pairs) << (s + 1));
       mux_into(cl, cl.leaves[left], cl.leaves[left + (size_t{1} << s)], s,
                ThreadPool::worker_id());
     });
   }
-  pool_.parallel_for(C, [&](size_t c) {
-    Client &cl = *clients_[c];
-    push_subtree(cl, std::move(cl.leaves[0]), chunk_bits_, ThreadPool::worker_id());
+  pool_.parallel_for(C * k_, [&](size_t t) {
+    Client &cl = *clients_[t / k_];
+    const size_t plane = t % k_;
+    push_subtree(cl, cl.stacks[plane], std::move(cl.leaves[plane * chunk_rows_]),
+                 chunk_bits_, ThreadPool::worker_id());
   });
   report_.merge_ms += ms_since(t0);
 }
@@ -461,18 +471,21 @@ void StreamPirServer::run_round() {
   pool_.parallel_for(C, [&](size_t c) {
     Client &cl = *clients_[c];
     const size_t tid = ThreadPool::worker_id();
-    for (size_t s = chunks; s < subtrees; ++s) {
-      Node zero;
-      zero.present = true;
-      push_subtree(cl, std::move(zero), chunk_bits_, tid);
-    }
-    Node &root = cl.stack[h_];
-    if (!root.present) throw std::logic_error("selection tree incomplete");
-    RlweCt result = root.zero ? zero_ct() : std::move(root.ct);
-    if (DBConsts::SmallQWidth < DBConsts::RnsMods[0])
-      server_ops::mod_switch_inplace(params_, result, params_.get_small_q());
+    // One response ciphertext per plane, back to back (fixed size each).
     std::ostringstream out;
-    server_ops::save_resp_to_stream(params_, result, out);
+    for (auto &stack : cl.stacks) {
+      for (size_t s = chunks; s < subtrees; ++s) {
+        Node zero;
+        zero.present = true;
+        push_subtree(cl, stack, std::move(zero), chunk_bits_, tid);
+      }
+      Node &root = stack[h_];
+      if (!root.present) throw std::logic_error("selection tree incomplete");
+      RlweCt result = root.zero ? zero_ct() : std::move(root.ct);
+      if (DBConsts::SmallQWidth < DBConsts::RnsMods[0])
+        server_ops::mod_switch_inplace(params_, result, params_.get_small_q());
+      server_ops::save_resp_to_stream(params_, result, out);
+    }
     const std::string s = out.str();
     // Release the client's round state before replying.
     cl.q_lo.reset();
@@ -481,7 +494,7 @@ void StreamPirServer::run_round() {
     std::vector<uint64_t>().swap(cl.inter_lo);
     std::vector<uint64_t>().swap(cl.inter_hi);
     std::vector<Node>().swap(cl.leaves);
-    std::vector<Node>().swap(cl.stack);
+    std::vector<std::vector<Node>>().swap(cl.stacks);
     cl.reply(std::vector<uint8_t>(s.begin(), s.end()));
   });
   report_.finish_ms = ms_since(finish_start);
@@ -497,8 +510,8 @@ void StreamPirServer::print_report(std::ostream &os) const {
   auto cpu = [&](uint64_t us) { return ms(static_cast<double>(us) / 1000.0); };
   os << "=== OnionPIR streaming server timing ===\n"
      << "  Clients: " << clients_.size() << "  threads: " << pool_.size()
-     << "  chunk rows: " << chunk_rows_ << " (" << chunk_rows_ * n_
-     << " plaintexts/chunk)\n"
+     << "  chunk rows: " << chunk_rows_ << " (" << k_ * chunk_rows_ * n_
+     << " plaintexts/chunk)  plaintexts/record: " << k_ << "\n"
      << "  Database streamed: " << report_.records << " records = "
      << std::fixed << std::setprecision(1) << report_.db_mbytes << " MB; "
      << report_.real_rows << " of " << (size_t{1} << h_)

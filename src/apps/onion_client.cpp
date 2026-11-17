@@ -174,6 +174,7 @@ int main(int argc, char **argv) {
     };
     std::cout << "Layout: N=" << N << " RecordBytes=" << B
               << " records/plaintext=" << layout.records_per_pt
+              << " plaintexts/record=" << layout.pts_per_record
               << " plaintexts=" << params.get_num_pt()
               << " fst_dim=" << params.get_fst_dim_sz()
               << " num_dims=" << params.get_num_dims() << std::endl;
@@ -196,13 +197,28 @@ int main(int argc, char **argv) {
       SimClient &cl = clients[cid];
       const auto t0 = Clock::now();
       std::stringstream ss(std::string(payload.begin(), payload.end()));
-      RlweCt ct = cl.pir->load_resp_from_stream(ss);
-      RlwePt pt = cl.pir->decrypt_mod_q(ct);
-      cl.noise_budget = cl.pir->last_noise_budget();
-      const size_t off = layout.offset_of(cl.index);
-      std::vector<uint8_t> bytes(off + B);
-      coeffs_to_bytes(pt.data.data(), bytes.data(), bytes.size());
-      cl.record.assign(bytes.begin() + off, bytes.end());
+      if (layout.pts_per_record == 1) {
+        RlweCt ct = cl.pir->load_resp_from_stream(ss);
+        RlwePt pt = cl.pir->decrypt_mod_q(ct);
+        cl.noise_budget = cl.pir->last_noise_budget();
+        const size_t off = layout.offset_of(cl.index);
+        std::vector<uint8_t> bytes(off + B);
+        coeffs_to_bytes(pt.data.data(), bytes.data(), bytes.size());
+        cl.record.assign(bytes.begin() + off, bytes.end());
+      } else {
+        // One response ciphertext per plane; plane j holds bytes
+        // [j * plaintext_bytes(), ...) of the record.
+        cl.record.assign(B, 0);
+        cl.noise_budget = INT32_MAX;
+        for (size_t j = 0; j < layout.pts_per_record; ++j) {
+          RlweCt ct = cl.pir->load_resp_from_stream(ss);
+          RlwePt pt = cl.pir->decrypt_mod_q(ct);
+          cl.noise_budget = std::min(cl.noise_budget, cl.pir->last_noise_budget());
+          const size_t start = j * plaintext_bytes();
+          coeffs_to_bytes(pt.data.data(), cl.record.data() + start,
+                          std::min(plaintext_bytes(), B - start));
+        }
+      }
       std::vector<uint8_t> want(B);
       expected_record(cl.index, B, want.data());
       cl.ok = cl.record == want;
@@ -326,6 +342,7 @@ int main(int argc, char **argv) {
     std::cout
               << "Layout: N=" << N << " RecordBytes=" << B
               << " records/plaintext=" << layout.records_per_pt
+              << " plaintexts/record=" << layout.pts_per_record
               << " plaintexts=" << params.get_num_pt()
               << " fst_dim=" << params.get_fst_dim_sz()
               << " num_dims=" << params.get_num_dims() << "\n"

@@ -93,9 +93,15 @@ database is the unmodified Go service from the Zealot/shuffle repository
   stubs (`proto_gen`) and record format (`utility`) straight from the shuffle
   checkout, so the API cannot drift. Clients verify each record with shuffle's
   own `utility.GenerateRecord`, through the same bridge.
-- *Records → plaintexts.* With `B = RecordBytes`, each plaintext holds
+- *Records → plaintexts.* With `B = RecordBytes ≤ 3072`, each plaintext holds
   `floor(3072 / B)` whole records (3072 B = 12 bits × 2048 coefficients), so one
-  query retrieves one record. `B ≤ 3072` is required.
+  query retrieves one record. Larger records span `k = ceil(B / 3072)`
+  plaintexts ("planes"): record r is PIR index r in every plane. The client
+  still sends one query; the server stacks the k planes as extra first-dimension
+  rows against it, runs one selection tree per plane with the same RGSW
+  selectors, and returns k response ciphertexts in one result. `--chunk-rows`
+  budgets plaintexts per chunk, so the server streams `chunk_rows / k` rows
+  per chunk (rounded down to a power of two).
 - *One round.* Clients upload keys (offline), then queries. The server
   preprocesses each query as it arrives (expansion, RGSW selectors, first-dim
   query in NTT form). Once all C are in, it streams records `[0, N)` once, in

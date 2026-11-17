@@ -12,8 +12,8 @@ the database). A failed run is recorded and the sweep continues. Three sweeps:
           or --config), C overridden per run. With fewer clients than proxies
           (C=1 on 3 proxies) one OnionPIR server runs, on the database streamer.
   vary B  (--record-sizes): N=1e6, C=1000 (same config), RecordBytes overridden
-          per run. B must fit one plaintext (3072 B): larger records would
-          span plaintexts, which the streaming server does not support.
+          per run. Records above 3072 B span ceil(B / 3072) plaintexts, and
+          the response carries one ciphertext per plaintext.
 
   python3 scripts/sweep.py --aws-config ../shuffle/awsConfigs/c8i16xlarge.json
   python3 scripts/sweep.py --aws-config ... --sizes 10000 100000
@@ -48,7 +48,6 @@ import experiment as ex  # noqa: E402
 
 DEFAULT_SIZES = [10_000, 100_000, 1_000_000, 10_000_000]
 DEFAULT_CONFIG_DIR = os.path.join(ex.REPO_ROOT, "testFiles", "C1000_B1024")
-PLAINTEXT_BYTES = 3072  # stream::plaintext_bytes(): 12 bits x 2048 coefficients
 
 
 def read(path):
@@ -155,7 +154,7 @@ def main():
     vary.add_argument("--sizes", type=int, nargs="+", help="vary N (default: 1e4 1e5 1e6 1e7)")
     vary.add_argument("--clients", type=int, nargs="+", help="vary C instead, at the --config's N")
     vary.add_argument("--record-sizes", type=int, nargs="+",
-                      help=f"vary RecordBytes instead (each <= {PLAINTEXT_BYTES}), at the --config's N and C")
+                      help="vary RecordBytes instead, at the --config's N and C")
     ap.add_argument("--config-dir", default=DEFAULT_CONFIG_DIR, help="holds N<N>.json for each size")
     ap.add_argument("--config", default=os.path.join(DEFAULT_CONFIG_DIR, "N1000000.json"),
                     help="experiment config for --clients / --record-sizes (default: N=1e6, C=1000, 1 KiB)")
@@ -178,10 +177,6 @@ def main():
         runs = [(f"C{c}", n, config, ["--C", str(c)], c) for c in args.clients]
         sweep = f"N{n}_B{ex.load_config(config)['RecordBytes']}_vary_C"
     elif args.record_sizes:
-        too_big = [b for b in args.record_sizes if b > PLAINTEXT_BYTES]
-        if too_big:
-            sys.exit(f"RecordBytes {too_big} exceed one OnionPIR plaintext ({PLAINTEXT_BYTES} B); "
-                     "records spanning plaintexts are not supported (src/stream/record_codec.h)")
         config = ex.resolve(args.config, os.getcwd())
         base = ex.load_config(config)
         runs = [(f"B{b}", base["N"], config, ["--B", str(b)], None) for b in args.record_sizes]

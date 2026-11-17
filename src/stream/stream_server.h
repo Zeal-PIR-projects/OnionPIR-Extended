@@ -15,6 +15,11 @@
 //      selection tree;
 //   4. finishes each client's tree, mod-switches, and replies.
 //
+// Records larger than a plaintext span k planes (record_codec.h). The planes
+// are stacked as extra first-dimension rows (k * rows per chunk) against the
+// same query, each plane has its own selection tree driven by the same RGSW
+// selectors, and the reply carries k mod-switched ciphertexts back to back.
+//
 // Selection tree. PirServer::evaluate_other_dim resolves row bits in the
 // order (bit 0, bit h-1, bit h-2, ..., bit 1). A mux by an encrypted bit is
 // exact in any order, so the streaming server instead merges adjacent
@@ -91,6 +96,7 @@ public:
 
   void print_report(std::ostream &os) const;
   size_t chunk_rows() const { return chunk_rows_; }
+  size_t planes() const { return k_; }
   // Approximate server memory held per client during the round.
   size_t bytes_per_client() const;
 
@@ -111,16 +117,17 @@ private:
     std::unique_ptr<uint32_t[], AlignedDeleter<uint32_t>> q_lo, q_hi;
     std::vector<GSWCt> selectors;  // selectors[j] = RGSW(query bit j+1)
     // Per-chunk state.
-    std::vector<uint64_t> inter_lo, inter_hi;  // [level][row][2]
-    std::vector<Node> leaves;                   // chunk_rows subtree leaves
-    std::vector<Node> stack;                    // levels 0..h
+    std::vector<uint64_t> inter_lo, inter_hi;  // [level][plane * rows + row][2]
+    std::vector<Node> leaves;                   // [plane][chunk_rows] subtree leaves
+    std::vector<std::vector<Node>> stacks;      // [plane][level 0..h]
   };
 
   void preprocess(uint32_t client_id, RlweCt &query);
   GSWCt &selector_for_bit(Client &cl, size_t bit);
   // x <- mux(x, y; bit) where `bit` selects y. Zero-aware.
   void mux_into(Client &cl, Node &x, Node &y, size_t bit, size_t tid);
-  void push_subtree(Client &cl, Node node, size_t level, size_t tid);
+  void push_subtree(Client &cl, std::vector<Node> &stack, Node node,
+                    size_t level, size_t tid);
   void encode_chunk(const uint8_t *raw, size_t first_pt, size_t rows);
   void process_chunk(size_t rows);
   RlweCt zero_ct() const;
@@ -132,6 +139,7 @@ private:
   size_t n_;           // fst_dim_sz
   size_t h_;           // num_dims - 1
   size_t levels_;      // coefficients per polynomial (N * K)
+  size_t k_;           // planes (plaintexts) per record
   size_t chunk_rows_;  // power of two, <= 2^h
   size_t chunk_bits_;  // log2(chunk_rows_)
   uint64_t q_, q1_, q2_, q1_inv_mod_q2_;

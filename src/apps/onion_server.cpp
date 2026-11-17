@@ -65,6 +65,7 @@ int main(int argc, char **argv) {
     StreamPirServer server(params, layout, opts);
     std::cout << "Layout: N=" << N << " RecordBytes=" << B
               << " records/plaintext=" << layout.records_per_pt
+              << " plaintexts/record=" << layout.pts_per_record
               << " plaintexts=" << layout.num_real_pt << " (padded "
               << params.get_num_pt() << ")\n"
               << "Server state per client ~" << server.bytes_per_client() / (1 << 20)
